@@ -151,10 +151,19 @@ final class MinimapAsset {
     // Internals
     // ------------------------------------------------------------------
 
-    /** Pushes {@code bytes} under bare, {@code @2x}, and pack-canonical names. */
+    /**
+     * Pushes {@code bytes} under the canonical pack-resolved name. The
+     * client's image resolver takes a {@code Background}/{@code TexturePath}
+     * value, resolves it relative to the .ui document's location
+     * ({@code UI/Custom/meridian-minimap-texture.ui} for us), and appends
+     * {@code @2x}. So {@code Background: "mt_p1_p2.png"} ends up looking up
+     * {@code UI/Custom/mt_p1_p2@2x.png} — the single name we push here.
+     *
+     * <p>If textures stop appearing, restore the multi-name fallback (push
+     * also under bare and {@code @2x}-only names) to cover resolvers that
+     * use different conventions.
+     */
     private static void pushUnderAllNames(ProxySession session, String baseNoExt, byte[] bytes) {
-        AssetPusher.push(session, baseNoExt + ".png", bytes);
-        AssetPusher.push(session, baseNoExt + "@2x.png", bytes);
         AssetPusher.push(session, "UI/Custom/" + baseNoExt + "@2x.png", bytes);
     }
 
