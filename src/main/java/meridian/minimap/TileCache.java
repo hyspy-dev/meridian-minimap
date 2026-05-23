@@ -1,5 +1,6 @@
 package meridian.minimap;
 
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import meridian.protocol.packets.worldmap.MapChunk;
@@ -33,13 +34,23 @@ final class TileCache {
     private final ConcurrentHashMap<Long, MapImage> chunks = new ConcurrentHashMap<>();
     /** Flipped to true on any put — minimap reads it to know "redraw needed". */
     private final AtomicBoolean modified = new AtomicBoolean(false);
+    /**
+     * Chunk keys that arrived (or changed) since the last
+     * {@link #consumeChangedKeys}. The minimap drains this each tick to
+     * invalidate exactly the rendered tiles whose underlying data changed,
+     * avoiding the "tile permanently shows sky-colour after the chunk
+     * finally arrives" failure mode.
+     */
+    private final Set<Long> changedKeys = ConcurrentHashMap.newKeySet();
 
     /** Replaces (or installs) the tile for one chunk. */
     void put(int cx, int cz, MapImage img) {
         if (img == null || img.packedIndices == null || img.packedIndices.length == 0) {
             return;
         }
-        chunks.put(key(cx, cz), img);
+        long k = key(cx, cz);
+        chunks.put(k, img);
+        changedKeys.add(k);
         modified.set(true);
     }
 
@@ -93,6 +104,22 @@ final class TileCache {
     boolean consumeModified() {
         return modified.getAndSet(false);
     }
+
+    /**
+     * Returns the chunk keys that received new data since the last call and
+     * clears the internal set. Empty if no changes since last consume. The
+     * minimap uses this to invalidate exactly the affected tiles, leaving
+     * unchanged tiles cached.
+     */
+    Set<Long> consumeChangedKeys() {
+        Set<Long> snapshot = Set.copyOf(changedKeys);
+        changedKeys.clear();
+        return snapshot;
+    }
+
+    /** Decompose a chunk key produced by this cache into (cx, cz). */
+    static int chunkXOf(long key) { return (int) (key >> 32); }
+    static int chunkZOf(long key) { return (int) (long) key; }
 
     void clear() {
         chunks.clear();

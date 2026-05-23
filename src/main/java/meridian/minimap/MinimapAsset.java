@@ -147,6 +147,22 @@ final class MinimapAsset {
         }
     }
 
+    /**
+     * Forgets the rendered tile for {@code (tileX, tileZ)}. The next
+     * {@link #ensureTile} call for these coords will re-render and re-push
+     * the asset under the same canonical name; an Anchor-level
+     * {@code Set Background} from the caller will then re-bind the texture
+     * (the asset name didn't change, but its content hash did).
+     *
+     * <p>Used when the underlying world chunk receives new data — without
+     * this, the rendered tile would freeze at the colours present when it
+     * was first generated (typically sky-blue for unloaded chunks).
+     */
+    void invalidate(int tileX, int tileZ) {
+        long key = ((long) tileX << 32) | (tileZ & 0xFFFFFFFFL);
+        renderedTiles.remove(key);
+    }
+
     // ------------------------------------------------------------------
     // Internals
     // ------------------------------------------------------------------

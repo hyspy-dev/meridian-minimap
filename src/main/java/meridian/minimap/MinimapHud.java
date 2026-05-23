@@ -326,7 +326,17 @@ final class MinimapHud {
     private int updateTerrain(UICommandBuilder b, ProxySession s, Vec3 pos) {
         int snapTileX = (int) Math.floor(pos.x() / MinimapAsset.TILE_WORLD);
         int snapTileZ = (int) Math.floor(pos.z() / MinimapAsset.TILE_WORLD);
-        boolean tilesChanged = cache.consumeModified();
+
+        // Drain newly-arrived chunks and invalidate their corresponding
+        // rendered tiles — tile coords map 1:1 to chunk coords because
+        // TILE_WORLD == Hytale chunk side. Phase 1's ensureTile will then
+        // re-render those whose chunk is in the visible+ring area; tiles
+        // far from the player stay invalidated until visited again.
+        java.util.Set<Long> changedChunks = cache.consumeChangedKeys();
+        for (Long key : changedChunks) {
+            minimapAsset.invalidate(TileCache.chunkXOf(key), TileCache.chunkZOf(key));
+        }
+        boolean tilesChanged = !changedChunks.isEmpty();
 
         // Phase 1 — preload the visible-plus-one-ring area unconditionally.
         // Cached tiles cost a HashMap hit and return immediately; only fresh
