@@ -1,0 +1,21 @@
+{
+  "name": "Meridian Minimap",
+  "version": "0.1.0",
+  "main": "meridian.minimap.MinimapModule",
+  "priority": 100,
+  "updateUrl": "https://github.com/hyspy-dev/meridian-minimap/releases",
+  "dependsOn": {
+    "meridian-core": ">=0.2.0"
+  },
+  "requires": {
+    "packets": [
+      "CustomHud",
+      "UpdateWorldMap",
+      "ClientMovement",
+      "JoinWorld"
+    ],
+    "services": [
+      "meridian.core.api.EntityTracker"
+    ]
+  }
+}
