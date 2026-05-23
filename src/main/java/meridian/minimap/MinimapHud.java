@@ -1,6 +1,7 @@
 package meridian.minimap;
 
-import java.util.Arrays;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.Locale;
 import java.util.Optional;
 import java.util.UUID;
@@ -11,56 +12,48 @@ import meridian.core.api.Vec3;
 import meridian.protocol.packets.interface_.CustomHud;
 import meridian.protocol.packets.interface_.CustomUICommand;
 import meridian.protocol.packets.interface_.CustomUICommandType;
+import meridian.protocol.packets.setup.RequestCommonAssetsRebuild;
 import org.slf4j.Logger;
 
 /**
- * The in-game minimap HUD — a {@code CustomHud} of N×N tiny {@code Panel}
- * elements whose backgrounds are mutated by per-cell {@code Set} commands
- * every tick. Algorithm and layout ported from Landscaper's SimpleMinimap;
- * data source swapped from server-side {@code WorldMapManager} to our
- * {@link TileCache} fed by observed {@code UpdateWorldMap} packets.
+ * The in-game minimap HUD — a {@code CustomHud} backed by a single dynamic
+ * texture instead of a per-cell Panel grid. Each tick:
  *
- * <p>Lifecycle:
  * <ol>
- *   <li>{@link #bindSession} fires on the first observed Default-channel
- *       packet — we now have a pipe to the client.</li>
- *   <li>{@link #show} pushes the initial CustomHud (grid scaffolding, player
- *       marker, compass labels, coords container). One-time setup.</li>
- *   <li>{@link #tick} runs every {@link #TICK_MS} ms — recomputes the grid
- *       origin from the player's position, diffs cell colours against the
- *       last render, and emits a single CustomHud with the changed Set
- *       commands.</li>
+ *   <li>{@link MinimapAsset#regenerate} renders a PNG from the {@link TileCache}
+ *       (fed by observed {@code UpdateWorldMap} packets) and pushes it as a
+ *       new client asset under a sequence-suffixed name.</li>
+ *   <li>The HUD's {@code #MinimapTexture.Background} is {@code Set} to the
+ *       new asset reference; the client swaps in the fresh texture.</li>
+ *   <li>The previous tick's asset is removed to keep client memory stable.</li>
  * </ol>
+ *
+ * <p>Static overlays — center marker, compass labels, directional arrow,
+ * coordinates label — live in inline NOML markup pushed once at session
+ * bind time.
  */
 final class MinimapHud {
 
     // -- Layout ---------------------------------------------------------
-    // Bumped 1.5× on screen (and in visible blocks) — 50×50 cells of 6 px,
-    // each covering 6 world blocks. Display 300 px, visible diameter 300
-    // blocks, 2500 panels. Stays well under the empirically-found ceiling
-    // (~5000 panels was clean, ~9800 broke). Cell pixel-size and
-    // WORLD_BLOCKS unchanged from the prior chunky profile, so the
-    // readability and movement-stutter behaviour stay the same.
-    /** Number of cells per side. */
-    private static final int BLOCKS_PER_SIDE = 50;
-    /** Pixel size of one cell — chunky for readability. */
-    private static final int BLOCK_SIZE = 6;
-    /** World blocks each cell represents. Higher = wider view, less detail. */
-    private static final int WORLD_BLOCKS = 6;
-    private static final int TOTAL_BLOCKS = BLOCKS_PER_SIDE * BLOCKS_PER_SIDE;
-    private static final int DISPLAY_SIZE = BLOCKS_PER_SIDE * BLOCK_SIZE;
+    /** On-screen size of the minimap, pixels. Derived from the tile grid. */
+    private static final int DISPLAY_SIZE = MinimapAsset.DISPLAY_SIZE;
+    private static final int TILE_PX = MinimapAsset.TILE_PX;
+    private static final int GRID_SIDE = MinimapAsset.GRID_SIDE;
 
     // -- Behaviour ------------------------------------------------------
     static final long TICK_MS = 500;
     private static final String HUD_ID = "meridian-minimap";
     private static final int Z_ORDER = 50;
-    /** Sky / unknown colour, matches TileCache's SKY. Used for empty cells. */
-    private static final int SKY_COLOR = 0x87C5AB;
+    /** Name the .ui asset is pushed under (no @2x — UI docs don't use it). */
+    private static final String TEXTURE_UI_NAME = "meridian-minimap-texture.ui";
+    /** Reference path used in {@code .append("...")}. */
+    private static final String TEXTURE_UI_REF = "meridian-minimap-texture.ui";
 
     // -- Wire ---------------------------------------------------------
     private final Logger log;
     private final EntityTracker entities;
     private final TileCache cache;
+    private final MinimapAsset minimapAsset;
 
     private volatile ProxySession session;
     private volatile UUID currentWorld;
@@ -68,30 +61,20 @@ final class MinimapHud {
     private volatile boolean haveYaw;
 
     // -- Render state ---------------------------------------------------
-    private final boolean[] circleMask;
-    private final int[] displayedColors;
-    private int gridOriginX = Integer.MIN_VALUE;
-    private int gridOriginZ = Integer.MIN_VALUE;
     private int lastArrowDir = -1;
     private String lastCoordsStr = "";
+    private boolean textureUiPushed = false;
+    private int lastSnapTileX = Integer.MIN_VALUE;
+    private int lastSnapTileZ = Integer.MIN_VALUE;
+    private int lastScrollOffsetX = Integer.MIN_VALUE;
+    private int lastScrollOffsetZ = Integer.MIN_VALUE;
     private final AtomicBoolean initialized = new AtomicBoolean(false);
 
     MinimapHud(Logger log, EntityTracker entities, TileCache cache) {
         this.log = log;
         this.entities = entities;
         this.cache = cache;
-        this.circleMask = new boolean[TOTAL_BLOCKS];
-        this.displayedColors = new int[TOTAL_BLOCKS];
-        Arrays.fill(this.displayedColors, -1);
-        // Circle mask: cells inside the inscribed radius get terrain colour,
-        // everything else is transparent.
-        int r = BLOCKS_PER_SIDE / 2;
-        int rSq = r * r;
-        for (int i = 0; i < TOTAL_BLOCKS; i++) {
-            int dx = i % BLOCKS_PER_SIDE - r;
-            int dy = i / BLOCKS_PER_SIDE - r;
-            this.circleMask[i] = dx * dx + dy * dy <= rSq;
-        }
+        this.minimapAsset = new MinimapAsset(log, cache);
     }
 
     // ------------------------------------------------------------------
@@ -108,11 +91,6 @@ final class MinimapHud {
     void onJoinWorld(UUID world) {
         if (!java.util.Objects.equals(world, this.currentWorld)) {
             this.currentWorld = world;
-            // World change — discard cached cells so we don't blit stale
-            // colours into the new world's terrain.
-            Arrays.fill(this.displayedColors, -1);
-            this.gridOriginX = Integer.MIN_VALUE;
-            this.gridOriginZ = Integer.MIN_VALUE;
             this.lastArrowDir = -1;
             this.lastCoordsStr = "";
             this.initialized.set(false);
@@ -142,7 +120,8 @@ final class MinimapHud {
         }
 
         UICommandBuilder b = new UICommandBuilder();
-        int updates = updateTerrain(b, pos);
+        int updates = updateTerrain(b, s, pos);
+        updates += updateSmoothScroll(b, pos);
         updates += updateArrow(b);
         updates += updateCoords(b, pos);
 
@@ -152,17 +131,30 @@ final class MinimapHud {
     }
 
     // ------------------------------------------------------------------
-    // Initial render — one big CustomHud that lays out everything
+    // Initial render — one CustomHud lays out the static overlay
+    // (marker + compass + coords) and a placeholder texture Panel; the
+    // texture itself is updated per-tick.
     // ------------------------------------------------------------------
 
     private void show(ProxySession s, Vec3 pos) {
-        // Recompute origin so the very first frame paints the right tiles.
-        recomputeOrigin(pos);
+        // First push the placeholder tile (referenced by every Panel's
+        // initial Background) so the asset exists before the .ui that
+        // references it is parsed. Then push the .ui itself.
+        if (!textureUiPushed) {
+            try {
+                minimapAsset.pushPlaceholder(s);
+            } catch (IOException e) {
+                log.warn("meridian-minimap: placeholder PNG push failed", e);
+            }
+            pushTextureUi(s);
+            textureUiPushed = true;
+        }
+        // Reset boundary tracker so updateTerrain repaints all 169 slots.
+        lastSnapTileX = Integer.MIN_VALUE;
+        lastSnapTileZ = Integer.MIN_VALUE;
 
         UICommandBuilder b = new UICommandBuilder();
 
-        // Root anchored to the top-right corner — minimap display +
-        // coordinates label below.
         int rootHeight = DISPLAY_SIZE + 20;
         b.appendInlineToRoot(String.format(Locale.ROOT,
                 "Group #MinimapRoot { Anchor: (Top: 10, Right: 10, Width: %d, Height: %d); "
@@ -175,39 +167,64 @@ final class MinimapHud {
                 DISPLAY_SIZE, DISPLAY_SIZE,
                 DISPLAY_SIZE, rootHeight));
 
-        // Cell grid — one Panel per cell with id #B<i>, background set by
-        // per-tick Set commands after scaffolding lands.
-        buildTerrainGrid(b);
+        // Load the texture Panel into MinimapContainer.
+        b.append("#MinimapContainer", TEXTURE_UI_REF);
+
         buildMarkerOverlay(b);
         buildCoordinates(b);
 
-        // First frame's content so the user sees the map immediately.
-        updateTerrain(b, pos);
+        // First frame's content.
+        updateTerrain(b, s, pos);
         updateArrow(b);
         updateCoords(b, pos);
 
         CustomHud hud = new CustomHud(HUD_ID, Z_ORDER, true, b.commands());
         s.sendToClient(hud);
-        log.info("meridian-minimap: pushed initial HUD ({} cells)", TOTAL_BLOCKS);
+        log.info("meridian-minimap: pushed initial HUD (texture-backed)");
     }
 
-    /** Lays out the TOTAL_BLOCKS cell Panels in a grid. */
-    private void buildTerrainGrid(UICommandBuilder b) {
-        for (int row = 0; row < BLOCKS_PER_SIDE; row++) {
-            StringBuilder sb = new StringBuilder(BLOCKS_PER_SIDE * 80);
-            for (int col = 0; col < BLOCKS_PER_SIDE; col++) {
-                int i = row * BLOCKS_PER_SIDE + col;
-                sb.append("Panel #B").append(i)
-                        .append(" { Anchor: (Left: ").append(col * BLOCK_SIZE)
-                        .append(", Top: ").append(row * BLOCK_SIZE)
-                        .append(", Width: ").append(BLOCK_SIZE)
-                        .append(", Height: ").append(BLOCK_SIZE)
-                        .append("); Background: ")
-                        .append(circleMask[i] ? "#000000" : "#00000000")
-                        .append("; } ");
+    /**
+     * Ships the .ui asset that defines the {@code GRID_SIDE}×{@code GRID_SIDE}
+     * tile-Panel grid. Each Panel's initial {@code Background} is a path
+     * string pointing at the placeholder PNG — that locks the Background's
+     * type to "texture path" at parse time so subsequent
+     * {@code Set Background = "<tile>.png"} commands are accepted (a
+     * Color-typed initial would prevent that swap).
+     */
+    private void pushTextureUi(ProxySession s) {
+        // The grid container is larger than the visible viewport — it carries
+        // a 1-tile ring beyond the visible 7×7 area. The container shifts
+        // each tick to give the player smooth scrolling; the ring keeps the
+        // visible edge filled at any sub-tile offset. Initial Anchor.Left/Top
+        // is the fracX=0 case (-TILE_PX/2); updateSmoothScroll() adjusts it.
+        StringBuilder sb = new StringBuilder(GRID_SIDE * GRID_SIDE * 80);
+        sb.append("Group #TileGrid {\n");
+        sb.append("    Anchor: (Top: ").append(MinimapAsset.GRID_BASE_OFFSET)
+                .append(", Left: ").append(MinimapAsset.GRID_BASE_OFFSET)
+                .append(", Width: ").append(MinimapAsset.GRID_TOTAL_PX)
+                .append(", Height: ").append(MinimapAsset.GRID_TOTAL_PX).append(");\n");
+        for (int row = 0; row < GRID_SIDE; row++) {
+            for (int col = 0; col < GRID_SIDE; col++) {
+                int slot = row * GRID_SIDE + col;
+                sb.append("    Panel #T").append(slot).append(" {\n")
+                        .append("        Anchor: (Left: ").append(col * TILE_PX)
+                        .append(", Top: ").append(row * TILE_PX)
+                        .append(", Width: ").append(TILE_PX)
+                        .append(", Height: ").append(TILE_PX).append(");\n")
+                        .append("        Background: \"").append(MinimapAsset.PLACEHOLDER_REF)
+                        .append("\";\n")
+                        .append("    }\n");
             }
-            b.appendInline("#MinimapContainer", sb.toString());
         }
+        sb.append("}\n");
+        byte[] uiBytes = sb.toString().getBytes(StandardCharsets.UTF_8);
+
+        AssetPusher.push(s, TEXTURE_UI_NAME, uiBytes);
+        AssetPusher.push(s, "UI/Custom/" + TEXTURE_UI_NAME, uiBytes);
+        AssetPusher.push(s, "Common/UI/Custom/" + TEXTURE_UI_NAME, uiBytes);
+        s.sendToClient(new RequestCommonAssetsRebuild());
+        log.info("meridian-minimap: pushed tile-grid UI asset ({} bytes, {} panels)",
+                uiBytes.length, GRID_SIDE * GRID_SIDE);
     }
 
     private void sendPatch(ProxySession s, UICommandBuilder b) {
@@ -290,50 +307,97 @@ final class MinimapHud {
     // Tick helpers — fire every tick
     // ------------------------------------------------------------------
 
-    private void recomputeOrigin(Vec3 pos) {
-        double cx = pos.x();
-        double cz = pos.z();
-        int r = BLOCKS_PER_SIDE / 2;
-        // Snap origin to a multiple of WORLD_BLOCKS, then shift back by half
-        // the grid so the player sits at the centre. The grid only redraws
-        // when the player crosses a cell boundary — cheap to keep stable.
-        this.gridOriginX = (int) Math.floor(cx / WORLD_BLOCKS) * WORLD_BLOCKS - r * WORLD_BLOCKS;
-        this.gridOriginZ = (int) Math.floor(cz / WORLD_BLOCKS) * WORLD_BLOCKS - r * WORLD_BLOCKS;
+    /**
+     * Per-tick terrain refresh. Two phases:
+     *
+     * <ol>
+     *   <li><b>Preload ring</b> — for every tile in {@code visible + 1-tile
+     *       outer ring}, make sure it's already on the client. Most calls
+     *       are cache hits (HashMap lookup, no work). Only never-seen tiles
+     *       trigger render+push. This is what hides boundary-cross lag: the
+     *       row about to enter the viewport is already on the client before
+     *       the player gets there.</li>
+     *   <li><b>Visible Set</b> — only when the player crossed a tile boundary
+     *       (or new world data invalidated tiles), emit {@code Set Background}
+     *       commands for the visible 13×13 panels. Sets reference names that
+     *       are already cached client-side, so no waiting.</li>
+     * </ol>
+     */
+    private int updateTerrain(UICommandBuilder b, ProxySession s, Vec3 pos) {
+        int snapTileX = (int) Math.floor(pos.x() / MinimapAsset.TILE_WORLD);
+        int snapTileZ = (int) Math.floor(pos.z() / MinimapAsset.TILE_WORLD);
+        boolean tilesChanged = cache.consumeModified();
+
+        // Phase 1 — preload the visible-plus-one-ring area unconditionally.
+        // Cached tiles cost a HashMap hit and return immediately; only fresh
+        // tiles encode + push.
+        int half = GRID_SIDE / 2;
+        int preloadRadius = half + 1;
+        for (int dr = -preloadRadius; dr <= preloadRadius; dr++) {
+            for (int dc = -preloadRadius; dc <= preloadRadius; dc++) {
+                try {
+                    minimapAsset.ensureTile(s, snapTileX + dc, snapTileZ + dr);
+                } catch (IOException e) {
+                    log.warn("meridian-minimap: preload tile failed", e);
+                }
+            }
+        }
+        minimapAsset.flushPending(s);
+
+        // Phase 2 — Set Backgrounds only when the visible grid actually shifts.
+        if (snapTileX == lastSnapTileX && snapTileZ == lastSnapTileZ && !tilesChanged) {
+            return 0;
+        }
+        lastSnapTileX = snapTileX;
+        lastSnapTileZ = snapTileZ;
+
+        int updates = 0;
+        for (int row = 0; row < GRID_SIDE; row++) {
+            for (int col = 0; col < GRID_SIDE; col++) {
+                int tileX = snapTileX + (col - half);
+                int tileZ = snapTileZ + (row - half);
+                try {
+                    String ref = minimapAsset.ensureTile(s, tileX, tileZ);
+                    b.set("#T" + (row * GRID_SIDE + col) + ".Background", ref);
+                    updates++;
+                } catch (IOException e) {
+                    log.warn("meridian-minimap: tile render failed ({},{})", tileX, tileZ, e);
+                }
+            }
+        }
+        return updates;
     }
 
     /**
-     * Per-tick terrain refresh: for each cell inside the disc, look up the
-     * world-block colour from the tile cache and Set the corresponding
-     * Panel's Background. Diffed against the previous frame — only changed
-     * cells emit Set commands, so steady-state (camera moving without
-     * crossing cell boundaries) costs almost nothing.
+     * Smooth-scroll the tile-grid container: each tick the grid slides by
+     * the player's fractional position within the current tile, so the map
+     * moves continuously instead of jumping 32 px every boundary crossing.
+     *
+     * <p>Texture content stays the same between boundary crossings — only
+     * the container's Anchor offset changes. At the crossing, the offset
+     * wraps from {@code GRID_BASE_OFFSET - 31} back to {@code GRID_BASE_OFFSET}
+     * (a 31 px discontinuity) AND the textures shift by one tile via
+     * {@link #updateTerrain}'s Set commands. The net visual jump is one
+     * pixel — sub-pixel snap, barely visible.
+     *
+     * <p>Skips emitting Set commands when the player hasn't moved enough to
+     * shift the offset by at least one pixel — cheap to call every tick.
      */
-    private int updateTerrain(UICommandBuilder b, Vec3 pos) {
-        int oldX = gridOriginX;
-        int oldZ = gridOriginZ;
-        recomputeOrigin(pos);
-        boolean moved = (oldX != gridOriginX) || (oldZ != gridOriginZ);
-        boolean tilesChanged = cache.consumeModified();
-        if (!moved && !tilesChanged) {
+    private int updateSmoothScroll(UICommandBuilder b, Vec3 pos) {
+        int fracX = (int) Math.floor(pos.x() - Math.floor(pos.x() / MinimapAsset.TILE_WORLD)
+                * MinimapAsset.TILE_WORLD);
+        int fracZ = (int) Math.floor(pos.z() - Math.floor(pos.z() / MinimapAsset.TILE_WORLD)
+                * MinimapAsset.TILE_WORLD);
+        int offsetX = MinimapAsset.GRID_BASE_OFFSET - fracX;
+        int offsetZ = MinimapAsset.GRID_BASE_OFFSET - fracZ;
+        if (offsetX == lastScrollOffsetX && offsetZ == lastScrollOffsetZ) {
             return 0;
         }
-
-        int count = 0;
-        for (int i = 0; i < TOTAL_BLOCKS; i++) {
-            if (!circleMask[i]) continue;
-            int col = i % BLOCKS_PER_SIDE;
-            int row = i / BLOCKS_PER_SIDE;
-            int wx = gridOriginX + col * WORLD_BLOCKS;
-            int wz = gridOriginZ + row * WORLD_BLOCKS;
-            int color = cache.getColorAt(wx, wz);
-            if (color == 0) color = SKY_COLOR;
-            if (displayedColors[i] != color) {
-                b.set("#B" + i + ".Background", hex(color));
-                displayedColors[i] = color;
-                count++;
-            }
-        }
-        return count;
+        b.setAnchor("#TileGrid.Anchor", offsetX, offsetZ,
+                MinimapAsset.GRID_TOTAL_PX, MinimapAsset.GRID_TOTAL_PX);
+        lastScrollOffsetX = offsetX;
+        lastScrollOffsetZ = offsetZ;
+        return 1;
     }
 
     private int updateArrow(UICommandBuilder b) {
@@ -392,10 +456,45 @@ final class MinimapHud {
                     null, null, document));
         }
 
+        /**
+         * Loads a {@code .ui} asset by path and appends it to the HUD root.
+         * Unlike {@link #appendInlineToRoot}, the asset has a concrete source
+         * location on the client, so {@code TexturePath} references inside
+         * the document resolve correctly against {@code Common/UI/Custom/}.
+         */
+        void append(String documentPath) {
+            commands.add(new CustomUICommand(CustomUICommandType.Append,
+                    null, null, documentPath));
+        }
+
+        /** Loads a {@code .ui} asset into a specific selector target. */
+        void append(String selector, String documentPath) {
+            commands.add(new CustomUICommand(CustomUICommandType.Append,
+                    selector, null, documentPath));
+        }
+
         void set(String selector, String text) {
             // The server's Set protocol wraps the value as
             // {"0": <bsonValue>} — for a plain string that's {"0": "..."} as JSON.
             String data = "{\"0\":\"" + escapeJsonString(text) + "\"}";
+            commands.add(new CustomUICommand(CustomUICommandType.Set, selector, data, null));
+        }
+
+        /** Set on an int-typed property — value goes unquoted as a JSON number. */
+        void set(String selector, int value) {
+            String data = "{\"0\":" + value + "}";
+            commands.add(new CustomUICommand(CustomUICommandType.Set, selector, data, null));
+        }
+
+        /**
+         * Set the whole {@code Anchor} struct on an element — Hytale's
+         * runtime {@code Anchor.Left} sub-selector doesn't fire; the whole
+         * object must be replaced. Field names follow the NOML PascalCase.
+         */
+        void setAnchor(String selector, int left, int top, int width, int height) {
+            String data = String.format(Locale.ROOT,
+                    "{\"0\":{\"Left\":%d,\"Top\":%d,\"Width\":%d,\"Height\":%d}}",
+                    left, top, width, height);
             commands.add(new CustomUICommand(CustomUICommandType.Set, selector, data, null));
         }
 
