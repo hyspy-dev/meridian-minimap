@@ -5,6 +5,7 @@ import meridian.api.module.ModuleContext;
 import meridian.api.module.ProxyModule;
 import meridian.api.packet.Direction;
 import meridian.api.packet.HandlerPosition;
+import meridian.api.settings.SettingsSpec;
 import meridian.core.api.EntityTracker;
 import org.slf4j.Logger;
 
@@ -50,6 +51,23 @@ public class MinimapModule implements ProxyModule {
                 Duration.ofMillis(MinimapHud.TICK_MS),
                 Duration.ofMillis(MinimapHud.TICK_MS));
 
-        log.info("meridian-minimap enabled — 44×44 minimap HUD, 500 ms tick");
+        // User-facing settings — corner, plus per-element show/hide. Every
+        // toggle is live: the SettingsSpec callback updates a field on the
+        // HUD and fires the appropriate Set commands when a session is bound.
+        // All four are persistent so preferences survive a proxy restart.
+        ctx.registerSettings(SettingsSpec.builder()
+                .enum_("position", "Position on screen",
+                        MinimapHud.Corner.class, MinimapHud.Corner.TOP_RIGHT,
+                        hud::setPosition)
+                .enum_("zoom", "Zoom level",
+                        MinimapHud.Zoom.class, MinimapHud.Zoom.NORMAL,
+                        hud::setZoom)
+                .bool("showCoords", "Show coordinates", true, hud::setShowCoords)
+                .bool("showCompass", "Show compass labels (N/S/W/E)", true, hud::setShowCompass)
+                .bool("showMarker", "Show player marker (center dot)", true, hud::setShowMarker)
+                .persistent("position", "zoom", "showCoords", "showCompass", "showMarker")
+                .build());
+
+        log.info("meridian-minimap enabled — texture-backed minimap, 500 ms tick");
     }
 }

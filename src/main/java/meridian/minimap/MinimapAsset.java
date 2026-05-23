@@ -42,14 +42,31 @@ final class MinimapAsset {
     // density (2 world blocks per pixel) so the minimap looks essentially
     // the same, just on a slightly bigger display (7×32 = 224 px).
 
-    /** World blocks per tile side. */
-    static final int TILE_WORLD = 32;
-    /** Image pixels per tile side — half the display, client upscales 2×. */
+    /**
+     * World blocks per tile side. Zoomable via {@link #setTileWorld}.
+     * Higher = wider visible area, coarser detail per pixel.
+     * Volatile because settings callbacks may flip it from the UI thread.
+     */
+    private volatile int tileWorld = 32;
+    /** Image pixels per tile side — fixed; on-screen tile size is constant. */
     static final int TILE_RENDER_PX = 16;
     /** On-screen size of one tile in pixels. */
     static final int TILE_PX = 32;
-    /** World blocks each render pixel represents. */
-    private static final int BLOCKS_PER_PIXEL = TILE_WORLD / TILE_RENDER_PX;
+
+    int getTileWorld() {
+        return tileWorld;
+    }
+
+    /**
+     * Changes the zoom level (world blocks per tile). Invalidates every
+     * rendered tile because the world↔tile mapping shifts; the next tick's
+     * preload pass will re-render the visible+ring area at the new scale.
+     */
+    void setTileWorld(int blocks) {
+        if (blocks == this.tileWorld) return;
+        this.tileWorld = blocks;
+        renderedTiles.clear();
+    }
     /** Visible tiles per side — what the user actually sees through the viewport. */
     static final int VISIBLE_SIDE = 7;
     /**
@@ -188,16 +205,16 @@ final class MinimapAsset {
     }
 
     private BufferedImage renderTile(int tileX, int tileZ) {
-        int originX = tileX * TILE_WORLD;
-        int originZ = tileZ * TILE_WORLD;
-        // Each pixel covers a BLOCKS_PER_PIXEL × BLOCKS_PER_PIXEL world square.
-        // Sample the top-left block of each square (nearest-neighbour) —
-        // cheap and gives the same "chunky" look the user asked for at half
-        // resolution. Could average for AA if quality matters more than CPU.
+        int currentTileWorld = tileWorld;
+        // Compute step per pixel from the current zoom — read once so the
+        // whole tile renders consistently even if settings flip mid-loop.
+        int blocksPerPixel = currentTileWorld / TILE_RENDER_PX;
+        int originX = tileX * currentTileWorld;
+        int originZ = tileZ * currentTileWorld;
         for (int py = 0; py < TILE_RENDER_PX; py++) {
-            int wz = originZ + py * BLOCKS_PER_PIXEL;
+            int wz = originZ + py * blocksPerPixel;
             for (int px = 0; px < TILE_RENDER_PX; px++) {
-                int wx = originX + px * BLOCKS_PER_PIXEL;
+                int wx = originX + px * blocksPerPixel;
                 int color = cache.getColorAt(wx, wz);
                 if (color == 0) color = SKY;
                 pixelBuffer[py * TILE_RENDER_PX + px] = 0xFF000000 | color;

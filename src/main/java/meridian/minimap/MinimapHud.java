@@ -34,6 +34,30 @@ import org.slf4j.Logger;
  */
 final class MinimapHud {
 
+    /** Where on the screen the minimap is anchored. */
+    public enum Corner {
+        TOP_RIGHT, TOP_LEFT, BOTTOM_RIGHT, BOTTOM_LEFT
+    }
+
+    /**
+     * How much world fits inside one minimap tile — lower number = more
+     * detail, smaller visible area. The on-screen tile size never changes;
+     * what changes is how much world each one covers.
+     */
+    public enum Zoom {
+        NEAR(16),     // ~112 blocks visible diameter
+        NORMAL(32),   // ~224 blocks visible
+        FAR(64),      // ~448 blocks visible
+        FURTHEST(128); // ~896 blocks visible
+
+        final int tileWorld;
+
+        Zoom(int tileWorld) {
+            this.tileWorld = tileWorld;
+        }
+    }
+
+
     // -- Layout ---------------------------------------------------------
     /** On-screen size of the minimap, pixels. Derived from the tile grid. */
     private static final int DISPLAY_SIZE = MinimapAsset.DISPLAY_SIZE;
@@ -59,6 +83,15 @@ final class MinimapHud {
     private volatile UUID currentWorld;
     private volatile float yaw;
     private volatile boolean haveYaw;
+
+    // -- Settings (live-updatable from SettingsSpec callbacks) ---------
+    /** Margin from the screen edge, pixels. */
+    private static final int CORNER_MARGIN = 10;
+    private volatile Corner position = Corner.TOP_RIGHT;
+    private volatile Zoom zoom = Zoom.NORMAL;
+    private volatile boolean showCoords = true;
+    private volatile boolean showCompass = true;
+    private volatile boolean showMarker = true;
 
     // -- Render state ---------------------------------------------------
     private int lastArrowDir = -1;
@@ -101,6 +134,70 @@ final class MinimapHud {
     void updateYaw(float yawRadians) {
         this.yaw = yawRadians;
         this.haveYaw = true;
+    }
+
+    // ------------------------------------------------------------------
+    // Live setting setters — called from SettingsSpec callbacks.
+    // ------------------------------------------------------------------
+
+    void setZoom(Zoom z) {
+        if (z == null || z == zoom) return;
+        zoom = z;
+        minimapAsset.setTileWorld(z.tileWorld);
+        // Reset snap & scroll trackers so the next tick re-evaluates
+        // everything at the new zoom level — Phase 2 fires (snap differs)
+        // and re-Sets all 81 panel Backgrounds with the freshly-rendered
+        // tiles MinimapAsset.setTileWorld() invalidated.
+        lastSnapTileX = Integer.MIN_VALUE;
+        lastSnapTileZ = Integer.MIN_VALUE;
+        lastScrollOffsetX = Integer.MIN_VALUE;
+        lastScrollOffsetZ = Integer.MIN_VALUE;
+        log.info("meridian-minimap: zoom set to {} ({} blocks/tile)",
+                z, z.tileWorld);
+    }
+
+    void setPosition(Corner p) {
+        if (p == null || p == position) return;
+        position = p;
+        ProxySession s = session;
+        if (s == null || !initialized.get()) return;
+        UICommandBuilder b = new UICommandBuilder();
+        b.setAnchorCorner("#MinimapRoot.Anchor", p, CORNER_MARGIN,
+                MinimapAsset.DISPLAY_SIZE, MinimapAsset.DISPLAY_SIZE + 20);
+        sendPatch(s, b);
+    }
+
+    void setShowCoords(boolean show) {
+        if (show == showCoords) return;
+        showCoords = show;
+        ProxySession s = session;
+        if (s == null || !initialized.get()) return;
+        UICommandBuilder b = new UICommandBuilder();
+        b.set("#CoordinatesDisplay.Visible", show);
+        sendPatch(s, b);
+    }
+
+    void setShowCompass(boolean show) {
+        if (show == showCompass) return;
+        showCompass = show;
+        ProxySession s = session;
+        if (s == null || !initialized.get()) return;
+        UICommandBuilder b = new UICommandBuilder();
+        b.set("#CompassN.Visible", show);
+        b.set("#CompassS.Visible", show);
+        b.set("#CompassW.Visible", show);
+        b.set("#CompassE.Visible", show);
+        sendPatch(s, b);
+    }
+
+    void setShowMarker(boolean show) {
+        if (show == showMarker) return;
+        showMarker = show;
+        ProxySession s = session;
+        if (s == null || !initialized.get()) return;
+        UICommandBuilder b = new UICommandBuilder();
+        b.set("#Marker.Visible", show);
+        sendPatch(s, b);
     }
 
     // ------------------------------------------------------------------
@@ -156,13 +253,17 @@ final class MinimapHud {
         UICommandBuilder b = new UICommandBuilder();
 
         int rootHeight = DISPLAY_SIZE + 20;
+        // Bake the current corner-anchor into the initial NOML so the HUD
+        // appears in the right place on the first frame — no flicker from
+        // a subsequent Set-Anchor command.
+        String rootAnchor = noml(position, CORNER_MARGIN, DISPLAY_SIZE, rootHeight);
         b.appendInlineToRoot(String.format(Locale.ROOT,
-                "Group #MinimapRoot { Anchor: (Top: 10, Right: 10, Width: %d, Height: %d); "
+                "Group #MinimapRoot { Anchor: %s; "
                         + "Panel #MinimapContainer { Anchor: (Top: 0, Width: %d, Height: %d); } "
                         + "Panel #MarkerOverlay { Anchor: (Top: 0, Width: %d, Height: %d); } "
                         + "Panel #CoordinatesContainer { Anchor: (Top: 0, Width: %d, Height: %d); } "
                         + "}",
-                DISPLAY_SIZE, rootHeight,
+                rootAnchor,
                 DISPLAY_SIZE, DISPLAY_SIZE,
                 DISPLAY_SIZE, DISPLAY_SIZE,
                 DISPLAY_SIZE, rootHeight));
@@ -178,9 +279,45 @@ final class MinimapHud {
         updateArrow(b);
         updateCoords(b, pos);
 
+        // Apply visibility settings — toggled values that were set before
+        // this session got applied here so the user's preferences carry
+        // over from a previous run. Markup defaults are everything visible.
+        if (!showCoords) b.set("#CoordinatesDisplay.Visible", false);
+        if (!showCompass) {
+            b.set("#CompassN.Visible", false);
+            b.set("#CompassS.Visible", false);
+            b.set("#CompassW.Visible", false);
+            b.set("#CompassE.Visible", false);
+        }
+        if (!showMarker) b.set("#Marker.Visible", false);
+
         CustomHud hud = new CustomHud(HUD_ID, Z_ORDER, true, b.commands());
         s.sendToClient(hud);
         log.info("meridian-minimap: pushed initial HUD (texture-backed)");
+    }
+
+    /** NOML-format Anchor expression for a corner-anchored element. */
+    private static String noml(Corner corner, int margin, int width, int height) {
+        switch (corner) {
+            case TOP_LEFT:
+                return String.format(Locale.ROOT,
+                        "(Top: %d, Left: %d, Width: %d, Height: %d)",
+                        margin, margin, width, height);
+            case TOP_RIGHT:
+                return String.format(Locale.ROOT,
+                        "(Top: %d, Right: %d, Width: %d, Height: %d)",
+                        margin, margin, width, height);
+            case BOTTOM_LEFT:
+                return String.format(Locale.ROOT,
+                        "(Bottom: %d, Left: %d, Width: %d, Height: %d)",
+                        margin, margin, width, height);
+            case BOTTOM_RIGHT:
+                return String.format(Locale.ROOT,
+                        "(Bottom: %d, Right: %d, Width: %d, Height: %d)",
+                        margin, margin, width, height);
+            default:
+                throw new IllegalArgumentException("Unknown corner: " + corner);
+        }
     }
 
     /**
@@ -324,8 +461,8 @@ final class MinimapHud {
      * </ol>
      */
     private int updateTerrain(UICommandBuilder b, ProxySession s, Vec3 pos) {
-        int snapTileX = (int) Math.floor(pos.x() / MinimapAsset.TILE_WORLD);
-        int snapTileZ = (int) Math.floor(pos.z() / MinimapAsset.TILE_WORLD);
+        int snapTileX = (int) Math.floor(pos.x() / minimapAsset.getTileWorld());
+        int snapTileZ = (int) Math.floor(pos.z() / minimapAsset.getTileWorld());
 
         // Drain newly-arrived chunks and invalidate their corresponding
         // rendered tiles — tile coords map 1:1 to chunk coords because
@@ -394,12 +531,22 @@ final class MinimapHud {
      * shift the offset by at least one pixel — cheap to call every tick.
      */
     private int updateSmoothScroll(UICommandBuilder b, Vec3 pos) {
-        int fracX = (int) Math.floor(pos.x() - Math.floor(pos.x() / MinimapAsset.TILE_WORLD)
-                * MinimapAsset.TILE_WORLD);
-        int fracZ = (int) Math.floor(pos.z() - Math.floor(pos.z() / MinimapAsset.TILE_WORLD)
-                * MinimapAsset.TILE_WORLD);
-        int offsetX = MinimapAsset.GRID_BASE_OFFSET - fracX;
-        int offsetZ = MinimapAsset.GRID_BASE_OFFSET - fracZ;
+        // Read zoom once — settings could flip it mid-tick.
+        int tileWorld = minimapAsset.getTileWorld();
+        // fracBlocks is the player's offset within the current tile, in
+        // WORLD BLOCKS (range [0, tileWorld)). The scroll offset needs to
+        // be in SCREEN PIXELS; at default zoom TILE_PX == tileWorld so the
+        // two coincide, but at FAR / FURTHEST the ratio TILE_PX/tileWorld
+        // becomes <1 and the offset must scale accordingly — otherwise the
+        // grid slides further than its own width and exposes empty stripes.
+        int fracXBlocks = (int) Math.floor(pos.x()
+                - Math.floor(pos.x() / tileWorld) * tileWorld);
+        int fracZBlocks = (int) Math.floor(pos.z()
+                - Math.floor(pos.z() / tileWorld) * tileWorld);
+        int fracXPx = fracXBlocks * MinimapAsset.TILE_PX / tileWorld;
+        int fracZPx = fracZBlocks * MinimapAsset.TILE_PX / tileWorld;
+        int offsetX = MinimapAsset.GRID_BASE_OFFSET - fracXPx;
+        int offsetZ = MinimapAsset.GRID_BASE_OFFSET - fracZPx;
         if (offsetX == lastScrollOffsetX && offsetZ == lastScrollOffsetZ) {
             return 0;
         }
@@ -505,6 +652,42 @@ final class MinimapHud {
             String data = String.format(Locale.ROOT,
                     "{\"0\":{\"Left\":%d,\"Top\":%d,\"Width\":%d,\"Height\":%d}}",
                     left, top, width, height);
+            commands.add(new CustomUICommand(CustomUICommandType.Set, selector, data, null));
+        }
+
+        /**
+         * Set an element's {@code Anchor} so it pins to a specific screen
+         * corner with the given margin. The omitted opposite-edge fields
+         * (e.g. {@code Left} when anchoring to right) are intentionally
+         * absent from the JSON — Hytale's Anchor codec treats absent fields
+         * as "not set", which is what we want for corner-anchoring.
+         */
+        void setAnchorCorner(String selector, Corner corner, int margin, int width, int height) {
+            String cornerJson;
+            switch (corner) {
+                case TOP_LEFT:
+                    cornerJson = "\"Top\":" + margin + ",\"Left\":" + margin;
+                    break;
+                case TOP_RIGHT:
+                    cornerJson = "\"Top\":" + margin + ",\"Right\":" + margin;
+                    break;
+                case BOTTOM_LEFT:
+                    cornerJson = "\"Bottom\":" + margin + ",\"Left\":" + margin;
+                    break;
+                case BOTTOM_RIGHT:
+                    cornerJson = "\"Bottom\":" + margin + ",\"Right\":" + margin;
+                    break;
+                default:
+                    throw new IllegalArgumentException("Unknown corner: " + corner);
+            }
+            String data = "{\"0\":{" + cornerJson
+                    + ",\"Width\":" + width + ",\"Height\":" + height + "}}";
+            commands.add(new CustomUICommand(CustomUICommandType.Set, selector, data, null));
+        }
+
+        /** Set on a bool-typed property — value goes as a JSON literal. */
+        void set(String selector, boolean value) {
+            String data = "{\"0\":" + (value ? "true" : "false") + "}";
             commands.add(new CustomUICommand(CustomUICommandType.Set, selector, data, null));
         }
 
