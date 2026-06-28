@@ -34,6 +34,14 @@ public class MinimapModule implements ProxyModule {
         TileCache cache = new TileCache();
         MinimapHud hud = new MinimapHud(log, entities, cache);
 
+        // S2C EARLY — drop the server's duplicate asset pushes before they reach the
+        // client. The client fatally rejects a second AssetInitialize for an
+        // already-downloading blob; a server-side minimap re-pushing its own tiles
+        // trips this, and our own asset load surfaces it. EARLY + DROP so the
+        // duplicate never reaches the forwarder. See AssetDedupGuard.
+        ctx.registerHandler(Direction.S2C, HandlerPosition.EARLY,
+                (direction, session) -> new AssetDedupGuard(log));
+
         // S2C WorldMap channel — captures UpdateWorldMap tiles into the cache.
         // MONITOR so we don't disturb the in-game world map's own pipeline.
         ctx.registerHandler(Direction.S2C, HandlerPosition.MONITOR,

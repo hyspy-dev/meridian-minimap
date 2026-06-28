@@ -94,6 +94,14 @@ final class MinimapAsset {
     private final TileCache cache;
     /** chunkKey({@code tileX, tileZ}) → reference name for the rendered tile. */
     private final Map<Long, String> renderedTiles = new HashMap<>();
+    /**
+     * Content SHA-256 → the reference name already pushed for that content.
+     * Tiles are content-addressable blobs on the client; multiple unloaded chunks
+     * render to identical bytes (same hash), and the client throws "blob download
+     * has already started" on a second {@code AssetInitialize} for that hash. This
+     * lets identical content reuse the first ref instead of re-pushing the blob.
+     */
+    private final Map<String, String> hashToRef = new HashMap<>();
     /** Pre-allocated pixel buffer reused for every tile render. */
     private final int[] pixelBuffer = new int[TILE_RENDER_PX * TILE_RENDER_PX];
     private boolean pendingRebuild = false;
@@ -126,6 +134,9 @@ final class MinimapAsset {
         img.setRGB(0, 0, TILE_RENDER_PX, TILE_RENDER_PX, fill, 0, TILE_RENDER_PX);
         byte[] bytes = encode(img);
         pushUnderAllNames(session, "mt_placeholder", bytes);
+        // Register the placeholder's content so a tile that renders to the same
+        // bytes reuses this ref instead of pushing a duplicate blob.
+        hashToRef.put(AssetPusher.hash(bytes), PLACEHOLDER_REF);
         return PLACEHOLDER_REF;
     }
 
@@ -141,10 +152,24 @@ final class MinimapAsset {
         if (ref != null) return ref;
 
         byte[] bytes = encode(renderTile(tileX, tileZ));
-        // Sign-safe coord encoding for the asset path.
-        String base = "mt_" + signed(tileX) + "_" + signed(tileZ);
+        // Content-addressable dedup: identical tile content (every unloaded chunk
+        // renders the same bytes) hashes the same, and the client throws "blob
+        // download has already started" on a second AssetInitialize for that hash.
+        // Reuse the ref already registered for this content instead of re-pushing.
+        String hash = AssetPusher.hash(bytes);
+        String existing = hashToRef.get(hash);
+        if (existing != null) {
+            renderedTiles.put(key, existing);
+            return existing;
+        }
+        // Content-addressed name so the asset is immutable: identical content always
+        // maps to the same name, and a name's bytes never change (a re-rendered tile
+        // gets a new hash → a new name). That makes the dedup above safe — a shared
+        // ref can never mutate under the tiles still pointing at it.
+        String base = "mt_" + hash;
         ref = base + ".png";
         pushUnderAllNames(session, base, bytes);
+        hashToRef.put(hash, ref);
         // Textures DO need the rebuild — empirically confirmed: skipping
         // this flag makes new tiles render as the missing-texture X.
         pendingRebuild = true;
@@ -166,10 +191,9 @@ final class MinimapAsset {
 
     /**
      * Forgets the rendered tile for {@code (tileX, tileZ)}. The next
-     * {@link #ensureTile} call for these coords will re-render and re-push
-     * the asset under the same canonical name; an Anchor-level
-     * {@code Set Background} from the caller will then re-bind the texture
-     * (the asset name didn't change, but its content hash did).
+     * {@link #ensureTile} call for these coords re-renders it; the new content
+     * gets a new content-addressed name, and the caller's {@code Set Background}
+     * re-binds the slot to it.
      *
      * <p>Used when the underlying world chunk receives new data — without
      * this, the rendered tile would freeze at the colours present when it
@@ -189,8 +213,8 @@ final class MinimapAsset {
      * client's image resolver takes a {@code Background}/{@code TexturePath}
      * value, resolves it relative to the .ui document's location
      * ({@code UI/Custom/meridian-minimap-texture.ui} for us), and appends
-     * {@code @2x}. So {@code Background: "mt_p1_p2.png"} ends up looking up
-     * {@code UI/Custom/mt_p1_p2@2x.png} — the single name we push here.
+     * {@code @2x}. So {@code Background: "mt_<hash>.png"} ends up looking up
+     * {@code UI/Custom/mt_<hash>@2x.png} — the single name we push here.
      *
      * <p>If textures stop appearing, restore the multi-name fallback (push
      * also under bare and {@code @2x}-only names) to cover resolvers that
@@ -198,10 +222,6 @@ final class MinimapAsset {
      */
     private static void pushUnderAllNames(ProxySession session, String baseNoExt, byte[] bytes) {
         AssetPusher.push(session, "UI/Custom/" + baseNoExt + "@2x.png", bytes);
-    }
-
-    private static String signed(int v) {
-        return v < 0 ? "n" + (-v) : "p" + v;
     }
 
     private BufferedImage renderTile(int tileX, int tileZ) {

@@ -31,6 +31,15 @@ final class AssetPusher {
      * Pushes {@code bytes} to the client under the asset name {@code name}.
      * Returns the SHA-256 hex hash assigned to the asset.
      */
+    /**
+     * The content-addressable SHA-256 hex id {@link #push} assigns to {@code bytes}.
+     * Exposed so callers can dedup by content before pushing — the client rejects a
+     * second {@link AssetInitialize} for a hash whose download already started.
+     */
+    static String hash(byte[] bytes) {
+        return sha256Hex(bytes);
+    }
+
     static String push(ProxySession session, String name, byte[] bytes) {
         String hash = sha256Hex(bytes);
         Asset asset = new Asset(hash, name);
