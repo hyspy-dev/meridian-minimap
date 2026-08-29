@@ -7,14 +7,10 @@
     <artifactId>meridian-minimap</artifactId>
     <version>0.1.0-SNAPSHOT</version>
 
-    <!-- In-game minimap HUD module. Layer-1 (Jedi) — observes UpdateWorldMap /
-         ClientMovement / JoinWorld and writes CustomHud back to the client, so
-         it touches raw meridian-protocol UI packets directly. The 44×44 colour
-         grid trick is borrowed from Landscaper's SimpleMinimap plugin —
-         each cell is a tiny Panel element addressed by selector, mutated via
-         differential Set commands every tick. -->
+    <!-- In-game minimap. A layer-2 module: it speaks only to meridian-core's
+         services, never to the protocol, so one build serves every version of
+         the game the proxy supports. -->
     <properties>
-        <meridian.protocol.version>245610536</meridian.protocol.version>
         <maven.compiler.source>21</maven.compiler.source>
         <maven.compiler.target>21</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
@@ -27,26 +23,11 @@
             <version>1.0.0-SNAPSHOT</version>
             <scope>provided</scope>
         </dependency>
-        <!-- Jedi opt-in: CustomHud / UpdateWorldMap / ClientMovement etc. -->
-        <dependency>
-            <groupId>meridian</groupId>
-            <artifactId>meridian-protocol</artifactId>
-            <version>${meridian.protocol.version}</version>
-            <scope>provided</scope>
-        </dependency>
-        <!-- EntityTracker for the local player position; tracker also publishes
-             yaw via its own observers, but we don't strictly need core for the
-             MVP — kept on for the future settings page. -->
+        <!-- Everything the minimap needs: the world map, the player, assets, the HUD. -->
         <dependency>
             <groupId>meridian</groupId>
             <artifactId>meridian-core-api</artifactId>
             <version>0.1.0-SNAPSHOT</version>
-            <scope>provided</scope>
-        </dependency>
-        <dependency>
-            <groupId>io.netty</groupId>
-            <artifactId>netty-all</artifactId>
-            <version>4.1.100.Final</version>
             <scope>provided</scope>
         </dependency>
         <dependency>

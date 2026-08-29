@@ -1,54 +1,41 @@
 package meridian.minimap;
 
-import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.Locale;
-import java.util.Optional;
 import java.util.UUID;
-import java.util.concurrent.atomic.AtomicBoolean;
-import meridian.api.session.ProxySession;
-import meridian.core.api.EntityTracker;
+import meridian.core.api.ClientAssets;
+import meridian.core.api.Hud;
+import meridian.core.api.Player;
 import meridian.core.api.Vec3;
-import meridian.protocol.packets.interface_.CustomHud;
-import meridian.protocol.packets.interface_.CustomUICommand;
-import meridian.protocol.packets.interface_.CustomUICommandType;
-import meridian.protocol.packets.setup.RequestCommonAssetsRebuild;
+import meridian.core.api.World;
+import meridian.core.api.WorldMap;
 import org.slf4j.Logger;
 
 /**
- * The in-game minimap HUD — a {@code CustomHud} backed by a single dynamic
- * texture instead of a per-cell Panel grid. Each tick:
+ * The minimap itself: a window onto the world map, drawn from a grid of tile textures with the
+ * player fixed at its centre.
  *
- * <ol>
- *   <li>{@link MinimapAsset#regenerate} renders a PNG from the {@link TileCache}
- *       (fed by observed {@code UpdateWorldMap} packets) and pushes it as a
- *       new client asset under a sequence-suffixed name.</li>
- *   <li>The HUD's {@code #MinimapTexture.Background} is {@code Set} to the
- *       new asset reference; the client swaps in the fresh texture.</li>
- *   <li>The previous tick's asset is removed to keep client memory stable.</li>
- * </ol>
- *
- * <p>Static overlays — center marker, compass labels, directional arrow,
- * coordinates label — live in inline NOML markup pushed once at session
- * bind time.
+ * <p>Everything is sent as a difference against what the client already has. A tick where the
+ * player has not moved sends nothing at all; walking sends a handful of property changes. Only
+ * crossing a tile boundary repaints the grid, and between boundaries the whole grid slides by a
+ * few pixels, which is what makes the map scroll rather than jump.
  */
 final class MinimapHud {
 
-    /** Where on the screen the minimap is anchored. */
+    /** Where on the screen the minimap sits. */
     public enum Corner {
         TOP_RIGHT, TOP_LEFT, BOTTOM_RIGHT, BOTTOM_LEFT
     }
 
     /**
-     * How much world fits inside one minimap tile — lower number = more
-     * detail, smaller visible area. The on-screen tile size never changes;
-     * what changes is how much world each one covers.
+     * How much world fits in one tile. The tiles keep their size on screen — what changes is
+     * how much ground each of them covers, and so how far the map sees.
      */
     public enum Zoom {
-        NEAR(16),     // ~112 blocks visible diameter
-        NORMAL(32),   // ~224 blocks visible
-        FAR(64),      // ~448 blocks visible
-        FURTHEST(128); // ~896 blocks visible
+        NEAR(16),     // about 112 blocks across
+        NORMAL(32),   // about 224 blocks
+        FAR(64),      // about 448 blocks
+        FURTHEST(128);
 
         final int tileWorld;
 
@@ -57,357 +44,276 @@ final class MinimapHud {
         }
     }
 
-
-    // -- Layout ---------------------------------------------------------
-    /** On-screen size of the minimap, pixels. Derived from the tile grid. */
-    private static final int DISPLAY_SIZE = MinimapAsset.DISPLAY_SIZE;
-    private static final int TILE_PX = MinimapAsset.TILE_PX;
-    private static final int GRID_SIDE = MinimapAsset.GRID_SIDE;
-
-    // -- Behaviour ------------------------------------------------------
     static final long TICK_MS = 500;
+
+    private static final int DISPLAY_SIZE = MinimapTiles.DISPLAY_SIZE;
+    private static final int TILE_PX = MinimapTiles.TILE_PX;
+    private static final int GRID_SIDE = MinimapTiles.GRID_SIDE;
+    private static final int CORNER_MARGIN = 10;
+
     private static final String HUD_ID = "meridian-minimap";
     private static final int Z_ORDER = 50;
-    /** Name the .ui asset is pushed under (no @2x — UI docs don't use it). */
-    private static final String TEXTURE_UI_NAME = "meridian-minimap-texture.ui";
-    /** Reference path used in {@code .append("...")}. */
-    private static final String TEXTURE_UI_REF = "meridian-minimap-texture.ui";
+    /**
+     * Where the grid document is put on the client, and how markup inside it refers to itself.
+     * The two differ: a reference inside a document is resolved against the folder the document
+     * came from, which is precisely why the tiles it shows can be named without a path.
+     */
+    private static final String GRID_UI_NAME = "UI/Custom/meridian-minimap-grid.ui";
+    private static final String GRID_UI_REF = "meridian-minimap-grid.ui";
 
-    // -- Wire ---------------------------------------------------------
     private final Logger log;
-    private final EntityTracker entities;
-    private final TileCache cache;
-    private final MinimapAsset minimapAsset;
+    private final World world;
+    private final WorldMap map;
+    private final Hud hud;
+    private final ClientAssets assets;
+    private final MinimapTiles tiles;
 
-    private volatile ProxySession session;
-    private volatile UUID currentWorld;
-    private volatile float yaw;
-    private volatile boolean haveYaw;
-
-    // -- Settings (live-updatable from SettingsSpec callbacks) ---------
-    /** Margin from the screen edge, pixels. */
-    private static final int CORNER_MARGIN = 10;
+    // -- Settings, live from the settings page --------------------------
     private volatile Corner position = Corner.TOP_RIGHT;
     private volatile Zoom zoom = Zoom.NORMAL;
     private volatile boolean showCoords = true;
     private volatile boolean showCompass = true;
     private volatile boolean showMarker = true;
 
-    // -- Render state ---------------------------------------------------
-    private int lastArrowDir = -1;
-    private String lastCoordsStr = "";
-    private boolean textureUiPushed = false;
-    private int lastSnapTileX = Integer.MIN_VALUE;
-    private int lastSnapTileZ = Integer.MIN_VALUE;
-    private int lastScrollOffsetX = Integer.MIN_VALUE;
-    private int lastScrollOffsetZ = Integer.MIN_VALUE;
-    private final AtomicBoolean initialized = new AtomicBoolean(false);
+    // -- What the client is currently showing ---------------------------
+    private UUID drawnWorld;
+    private boolean drawn;
+    private int lastTileX = Integer.MIN_VALUE;
+    private int lastTileZ = Integer.MIN_VALUE;
+    private int lastScrollX = Integer.MIN_VALUE;
+    private int lastScrollZ = Integer.MIN_VALUE;
+    private int lastArrow = -1;
+    private String lastCoords = "";
 
-    MinimapHud(Logger log, EntityTracker entities, TileCache cache) {
+    MinimapHud(Logger log, World world, WorldMap map, Hud hud, ClientAssets assets) {
         this.log = log;
-        this.entities = entities;
-        this.cache = cache;
-        this.minimapAsset = new MinimapAsset(log, cache);
+        this.world = world;
+        this.map = map;
+        this.hud = hud;
+        this.assets = assets;
+        this.tiles = new MinimapTiles(map, assets, log);
     }
 
     // ------------------------------------------------------------------
-    // Inputs from observers
-    // ------------------------------------------------------------------
-
-    void bindSession(ProxySession s) {
-        if (this.session == null) {
-            this.session = s;
-            log.info("meridian-minimap: bound Default-channel session");
-        }
-    }
-
-    void onJoinWorld(UUID world) {
-        if (!java.util.Objects.equals(world, this.currentWorld)) {
-            this.currentWorld = world;
-            this.lastArrowDir = -1;
-            this.lastCoordsStr = "";
-            this.initialized.set(false);
-            log.info("meridian-minimap: entered world {} — resetting HUD", world);
-        }
-    }
-
-    void updateYaw(float yawRadians) {
-        this.yaw = yawRadians;
-        this.haveYaw = true;
-    }
-
-    // ------------------------------------------------------------------
-    // Live setting setters — called from SettingsSpec callbacks.
+    // Settings
     // ------------------------------------------------------------------
 
     void setZoom(Zoom z) {
-        if (z == null || z == zoom) return;
+        if (z == null || z == zoom) {
+            return;
+        }
         zoom = z;
-        minimapAsset.setTileWorld(z.tileWorld);
-        // Reset snap & scroll trackers so the next tick re-evaluates
-        // everything at the new zoom level — Phase 2 fires (snap differs)
-        // and re-Sets all 81 panel Backgrounds with the freshly-rendered
-        // tiles MinimapAsset.setTileWorld() invalidated.
-        lastSnapTileX = Integer.MIN_VALUE;
-        lastSnapTileZ = Integer.MIN_VALUE;
-        lastScrollOffsetX = Integer.MIN_VALUE;
-        lastScrollOffsetZ = Integer.MIN_VALUE;
-        log.info("meridian-minimap: zoom set to {} ({} blocks/tile)",
-                z, z.tileWorld);
+        tiles.setTileWorld(z.tileWorld);
+        // Every tile now stands for a different piece of world, so nothing on screen is right
+        // any more. Forgetting where we were makes the next tick repaint and re-place the grid.
+        lastTileX = Integer.MIN_VALUE;
+        lastTileZ = Integer.MIN_VALUE;
+        lastScrollX = Integer.MIN_VALUE;
+        lastScrollZ = Integer.MIN_VALUE;
     }
 
     void setPosition(Corner p) {
-        if (p == null || p == position) return;
+        if (p == null || p == position) {
+            return;
+        }
         position = p;
-        ProxySession s = session;
-        if (s == null || !initialized.get()) return;
-        UICommandBuilder b = new UICommandBuilder();
-        b.setAnchorCorner("#MinimapRoot.Anchor", p, CORNER_MARGIN,
-                MinimapAsset.DISPLAY_SIZE, MinimapAsset.DISPLAY_SIZE + 20);
-        sendPatch(s, b);
+        if (drawn) {
+            hud.batch()
+                    .setRaw("#MinimapRoot.Anchor", cornerAnchor(p, DISPLAY_SIZE, rootHeight()))
+                    .patch(HUD_ID, Z_ORDER);
+        }
     }
 
     void setShowCoords(boolean show) {
-        if (show == showCoords) return;
+        if (show == showCoords) {
+            return;
+        }
         showCoords = show;
-        ProxySession s = session;
-        if (s == null || !initialized.get()) return;
-        UICommandBuilder b = new UICommandBuilder();
-        b.set("#CoordinatesDisplay.Visible", show);
-        sendPatch(s, b);
+        if (drawn) {
+            hud.batch().set("#CoordinatesDisplay.Visible", show).patch(HUD_ID, Z_ORDER);
+        }
     }
 
     void setShowCompass(boolean show) {
-        if (show == showCompass) return;
+        if (show == showCompass) {
+            return;
+        }
         showCompass = show;
-        ProxySession s = session;
-        if (s == null || !initialized.get()) return;
-        UICommandBuilder b = new UICommandBuilder();
-        b.set("#CompassN.Visible", show);
-        b.set("#CompassS.Visible", show);
-        b.set("#CompassW.Visible", show);
-        b.set("#CompassE.Visible", show);
-        sendPatch(s, b);
+        if (drawn) {
+            Hud.Batch b = hud.batch();
+            compassVisibility(b, show);
+            b.patch(HUD_ID, Z_ORDER);
+        }
     }
 
     void setShowMarker(boolean show) {
-        if (show == showMarker) return;
+        if (show == showMarker) {
+            return;
+        }
         showMarker = show;
-        ProxySession s = session;
-        if (s == null || !initialized.get()) return;
-        UICommandBuilder b = new UICommandBuilder();
-        b.set("#Marker.Visible", show);
-        sendPatch(s, b);
+        if (drawn) {
+            hud.batch().set("#Marker.Visible", show).patch(HUD_ID, Z_ORDER);
+        }
     }
 
     // ------------------------------------------------------------------
-    // Tick — called from the module's scheduler
+    // Tick
     // ------------------------------------------------------------------
 
     void tick() {
-        ProxySession s = session;
-        if (s == null) return;
-        Optional<Vec3> maybePos = entities.localPosition();
-        if (maybePos.isEmpty()) return;
-        Vec3 pos = maybePos.get();
+        UUID current = map.currentWorld();
+        if (!current.equals(drawnWorld)) {
+            // A new world means a client that has been emptied: our documents and textures are
+            // gone from it, whatever we think we sent. Start over.
+            drawnWorld = current;
+            drawn = false;
+            tiles.reset();
+            lastTileX = Integer.MIN_VALUE;
+            lastTileZ = Integer.MIN_VALUE;
+            lastScrollX = Integer.MIN_VALUE;
+            lastScrollZ = Integer.MIN_VALUE;
+            lastArrow = -1;
+            lastCoords = "";
+        }
 
-        if (initialized.compareAndSet(false, true)) {
-            show(s, pos);
+        Player player = world.player().orElse(null);
+        Vec3 pos = player == null ? null : player.position();
+        if (pos == null) {
             return;
         }
 
-        UICommandBuilder b = new UICommandBuilder();
-        int updates = updateTerrain(b, s, pos);
-        updates += updateSmoothScroll(b, pos);
-        updates += updateArrow(b);
-        updates += updateCoords(b, pos);
-
-        if (updates > 0) {
-            sendPatch(s, b);
+        if (!drawn) {
+            draw(pos, player);
+            return;
         }
+
+        Hud.Batch b = hud.batch();
+        paintTiles(b, pos);
+        scroll(b, pos);
+        arrow(b, player);
+        coordinates(b, pos);
+        b.patch(HUD_ID, Z_ORDER);
     }
 
     // ------------------------------------------------------------------
-    // Initial render — one CustomHud lays out the static overlay
-    // (marker + compass + coords) and a placeholder texture Panel; the
-    // texture itself is updated per-tick.
+    // First draw
     // ------------------------------------------------------------------
 
-    private void show(ProxySession s, Vec3 pos) {
-        // First push the placeholder tile (referenced by every Panel's
-        // initial Background) so the asset exists before the .ui that
-        // references it is parsed. Then push the .ui itself.
-        if (!textureUiPushed) {
-            try {
-                minimapAsset.pushPlaceholder(s);
-            } catch (IOException e) {
-                log.warn("meridian-minimap: placeholder PNG push failed", e);
-            }
-            pushTextureUi(s);
-            textureUiPushed = true;
-        }
-        // Reset boundary tracker so updateTerrain repaints all 169 slots.
-        lastSnapTileX = Integer.MIN_VALUE;
-        lastSnapTileZ = Integer.MIN_VALUE;
+    private void draw(Vec3 pos, Player player) {
+        // The grid document names the tile it starts out showing, so that tile has to be on the
+        // client before the document is read.
+        tiles.pushPlaceholder();
+        pushGridDocument();
+        tiles.flushRebuild();
 
-        UICommandBuilder b = new UICommandBuilder();
-
-        int rootHeight = DISPLAY_SIZE + 20;
-        // Bake the current corner-anchor into the initial NOML so the HUD
-        // appears in the right place on the first frame — no flicker from
-        // a subsequent Set-Anchor command.
-        String rootAnchor = noml(position, CORNER_MARGIN, DISPLAY_SIZE, rootHeight);
-        b.appendInlineToRoot(String.format(Locale.ROOT,
+        int rootHeight = rootHeight();
+        Hud.Batch b = hud.batch();
+        b.appendInline(String.format(Locale.ROOT,
                 "Group #MinimapRoot { Anchor: %s; "
                         + "Panel #MinimapContainer { Anchor: (Top: 0, Width: %d, Height: %d); } "
                         + "Panel #MarkerOverlay { Anchor: (Top: 0, Width: %d, Height: %d); } "
                         + "Panel #CoordinatesContainer { Anchor: (Top: 0, Width: %d, Height: %d); } "
                         + "}",
-                rootAnchor,
+                cornerMarkup(position, DISPLAY_SIZE, rootHeight),
                 DISPLAY_SIZE, DISPLAY_SIZE,
                 DISPLAY_SIZE, DISPLAY_SIZE,
                 DISPLAY_SIZE, rootHeight));
+        b.appendTo("#MinimapContainer", GRID_UI_REF);
+        markerOverlay(b);
+        coordinatesPanel(b);
 
-        // Load the texture Panel into MinimapContainer.
-        b.append("#MinimapContainer", TEXTURE_UI_REF);
+        paintTiles(b, pos);
+        scroll(b, pos);
+        arrow(b, player);
+        coordinates(b, pos);
 
-        buildMarkerOverlay(b);
-        buildCoordinates(b);
-
-        // First frame's content.
-        updateTerrain(b, s, pos);
-        updateArrow(b);
-        updateCoords(b, pos);
-
-        // Apply visibility settings — toggled values that were set before
-        // this session got applied here so the user's preferences carry
-        // over from a previous run. Markup defaults are everything visible.
-        if (!showCoords) b.set("#CoordinatesDisplay.Visible", false);
+        // The markup shows everything; the player may have turned some of it off in an earlier
+        // session, and those preferences arrive before the first frame is drawn.
+        if (!showCoords) {
+            b.set("#CoordinatesDisplay.Visible", false);
+        }
         if (!showCompass) {
-            b.set("#CompassN.Visible", false);
-            b.set("#CompassS.Visible", false);
-            b.set("#CompassW.Visible", false);
-            b.set("#CompassE.Visible", false);
+            compassVisibility(b, false);
         }
-        if (!showMarker) b.set("#Marker.Visible", false);
-
-        CustomHud hud = new CustomHud(HUD_ID, Z_ORDER, true, b.commands());
-        s.sendToClient(hud);
-        log.info("meridian-minimap: pushed initial HUD (texture-backed)");
-    }
-
-    /** NOML-format Anchor expression for a corner-anchored element. */
-    private static String noml(Corner corner, int margin, int width, int height) {
-        switch (corner) {
-            case TOP_LEFT:
-                return String.format(Locale.ROOT,
-                        "(Top: %d, Left: %d, Width: %d, Height: %d)",
-                        margin, margin, width, height);
-            case TOP_RIGHT:
-                return String.format(Locale.ROOT,
-                        "(Top: %d, Right: %d, Width: %d, Height: %d)",
-                        margin, margin, width, height);
-            case BOTTOM_LEFT:
-                return String.format(Locale.ROOT,
-                        "(Bottom: %d, Left: %d, Width: %d, Height: %d)",
-                        margin, margin, width, height);
-            case BOTTOM_RIGHT:
-                return String.format(Locale.ROOT,
-                        "(Bottom: %d, Right: %d, Width: %d, Height: %d)",
-                        margin, margin, width, height);
-            default:
-                throw new IllegalArgumentException("Unknown corner: " + corner);
+        if (!showMarker) {
+            b.set("#Marker.Visible", false);
         }
+
+        b.show(HUD_ID, Z_ORDER);
+        drawn = true;
+        log.info("meridian-minimap: drew the minimap for world {}", drawnWorld);
     }
 
     /**
-     * Ships the .ui asset that defines the {@code GRID_SIDE}×{@code GRID_SIDE}
-     * tile-Panel grid. Each Panel's initial {@code Background} is a path
-     * string pointing at the placeholder PNG — that locks the Background's
-     * type to "texture path" at parse time so subsequent
-     * {@code Set Background = "<tile>.png"} commands are accepted (a
-     * Color-typed initial would prevent that swap).
+     * Ships the document holding the grid of tile panels.
+     *
+     * <p>Each panel is born showing the placeholder image, given as a path. That is deliberate:
+     * it settles the panel background as being a picture rather than a colour, and a panel that
+     * started out a colour refuses to become a picture later.
      */
-    private void pushTextureUi(ProxySession s) {
-        // The grid container is larger than the visible viewport — it carries
-        // a 1-tile ring beyond the visible 7×7 area. The container shifts
-        // each tick to give the player smooth scrolling; the ring keeps the
-        // visible edge filled at any sub-tile offset. Initial Anchor.Left/Top
-        // is the fracX=0 case (-TILE_PX/2); updateSmoothScroll() adjusts it.
+    private void pushGridDocument() {
         StringBuilder sb = new StringBuilder(GRID_SIDE * GRID_SIDE * 80);
         sb.append("Group #TileGrid {\n");
-        sb.append("    Anchor: (Top: ").append(MinimapAsset.GRID_BASE_OFFSET)
-                .append(", Left: ").append(MinimapAsset.GRID_BASE_OFFSET)
-                .append(", Width: ").append(MinimapAsset.GRID_TOTAL_PX)
-                .append(", Height: ").append(MinimapAsset.GRID_TOTAL_PX).append(");\n");
+        sb.append("    Anchor: (Top: ").append(MinimapTiles.GRID_BASE_OFFSET)
+                .append(", Left: ").append(MinimapTiles.GRID_BASE_OFFSET)
+                .append(", Width: ").append(MinimapTiles.GRID_TOTAL_PX)
+                .append(", Height: ").append(MinimapTiles.GRID_TOTAL_PX).append(");\n");
         for (int row = 0; row < GRID_SIDE; row++) {
             for (int col = 0; col < GRID_SIDE; col++) {
-                int slot = row * GRID_SIDE + col;
-                sb.append("    Panel #T").append(slot).append(" {\n")
+                sb.append("    Panel #T").append(row * GRID_SIDE + col).append(" {\n")
                         .append("        Anchor: (Left: ").append(col * TILE_PX)
                         .append(", Top: ").append(row * TILE_PX)
                         .append(", Width: ").append(TILE_PX)
                         .append(", Height: ").append(TILE_PX).append(");\n")
-                        .append("        Background: \"").append(MinimapAsset.PLACEHOLDER_REF)
+                        .append("        Background: \"").append(MinimapTiles.PLACEHOLDER_REF)
                         .append("\";\n")
                         .append("    }\n");
             }
         }
         sb.append("}\n");
-        byte[] uiBytes = sb.toString().getBytes(StandardCharsets.UTF_8);
-
-        AssetPusher.push(s, TEXTURE_UI_NAME, uiBytes);
-        AssetPusher.push(s, "UI/Custom/" + TEXTURE_UI_NAME, uiBytes);
-        AssetPusher.push(s, "Common/UI/Custom/" + TEXTURE_UI_NAME, uiBytes);
-        s.sendToClient(new RequestCommonAssetsRebuild());
-        log.info("meridian-minimap: pushed tile-grid UI asset ({} bytes, {} panels)",
-                uiBytes.length, GRID_SIDE * GRID_SIDE);
+        assets.push(GRID_UI_NAME, sb.toString().getBytes(StandardCharsets.UTF_8));
+        assets.requestRebuild();
     }
 
-    private void sendPatch(ProxySession s, UICommandBuilder b) {
-        // clear=false → keep existing tree, apply the diff.
-        CustomHud hud = new CustomHud(HUD_ID, Z_ORDER, false, b.commands());
-        s.sendToClient(hud);
+    private int rootHeight() {
+        return DISPLAY_SIZE + 20;
     }
 
-
     // ------------------------------------------------------------------
-    // Scaffolding builders — fire once on first render
+    // The parts that never change
     // ------------------------------------------------------------------
 
-    /** Static marker overlay: a center dot, four compass labels, eight arrow panels. */
-    private void buildMarkerOverlay(UICommandBuilder b) {
+    /** The dot for the player, the direction they face, and the four compass letters. */
+    private void markerOverlay(Hud.Batch b) {
         int markerSize = 6;
         int cx = DISPLAY_SIZE / 2 - markerSize / 2;
         int cy = DISPLAY_SIZE / 2 - markerSize / 2;
         StringBuilder sb = new StringBuilder(2048);
 
-        // Centre dot.
         sb.append("Panel #Marker { Anchor: (Left: ").append(cx)
                 .append(", Top: ").append(cy)
                 .append(", Width: ").append(markerSize)
                 .append(", Height: ").append(markerSize)
                 .append("); Background: #FFFFFF; } ");
 
-        // Eight directional arrow segments (two panels each). One direction
-        // is visible at a time; the others sit transparent. We later flip
-        // backgrounds via Set in updateArrow.
+        // All eight directions are laid out once and left transparent; turning the player only
+        // colours one of them in, which is far less work than moving a shape around.
         arrowPair(sb, "ArrowN", DISPLAY_SIZE / 2 - 1, cy - 6, DISPLAY_SIZE / 2 - 2, cy - 4, true);
         arrowPair(sb, "ArrowNE", cx + 10, cy - 3, cx + 8, cy - 5, true);
         arrowPair(sb, "ArrowE", cx + markerSize + 4, cy + 2, cx + markerSize + 2, cy + 1, false);
         arrowPair(sb, "ArrowSE", cx + 10, cy + markerSize + 2, cx + 8, cy + markerSize + 4, true);
-        arrowPair(sb, "ArrowS", DISPLAY_SIZE / 2 - 1, cy + markerSize + 4, DISPLAY_SIZE / 2 - 2, cy + markerSize + 2, true);
+        arrowPair(sb, "ArrowS", DISPLAY_SIZE / 2 - 1, cy + markerSize + 4,
+                DISPLAY_SIZE / 2 - 2, cy + markerSize + 2, true);
         arrowPair(sb, "ArrowSW", cx - 4, cy + markerSize + 4, cx - 6, cy + markerSize + 2, false);
         arrowPair(sb, "ArrowW", cx - 6, cy + 2, cx - 4, cy + 1, false);
         arrowPair(sb, "ArrowNW", cx - 4, cy - 2, cx - 4, cy - 4, true);
 
-        // Compass labels.
         compassLabel(sb, "CompassN", DISPLAY_SIZE / 2 - 6, 6, "N");
         compassLabel(sb, "CompassS", DISPLAY_SIZE / 2 - 6, DISPLAY_SIZE - 12, "S");
         compassLabel(sb, "CompassW", 6, DISPLAY_SIZE / 2 - 6, "W");
         compassLabel(sb, "CompassE", DISPLAY_SIZE - 14, DISPLAY_SIZE / 2 - 6, "E");
 
-        b.appendInline("#MarkerOverlay", sb.toString());
+        b.appendInlineTo("#MarkerOverlay", sb.toString());
     }
 
     private static void arrowPair(StringBuilder sb, String name,
@@ -428,294 +334,151 @@ final class MinimapHud {
         sb.append("Label #").append(id)
                 .append(" { Anchor: (Left: ").append(x).append(", Top: ").append(y)
                 .append(", Width: 12, Height: 10); Text: \"").append(text)
-                .append("\"; Style: (FontSize: 10, TextColor: #FFFFFF, RenderBold: true, Alignment: Center); } ");
+                .append("\"; Style: (FontSize: 10, TextColor: #FFFFFF, RenderBold: true, "
+                        + "Alignment: Center); } ");
     }
 
-    private void buildCoordinates(UICommandBuilder b) {
-        b.appendInline("#CoordinatesContainer", String.format(Locale.ROOT,
+    private void coordinatesPanel(Hud.Batch b) {
+        b.appendInlineTo("#CoordinatesContainer", String.format(Locale.ROOT,
                 "Panel #CoordinatesDisplay { Anchor: (Top: %d, Right: 0, Width: %d, Height: 14); "
-                        + "Label #CoordinatesLabel { Anchor: (Left: 0, Top: 0, Width: %d, Height: 14); "
-                        + "Text: \"X: 0 Y: 0 Z: 0\"; "
-                        + "Style: (FontSize: 10, TextColor: #FFFFFF, RenderBold: true, Alignment: Center); } }",
+                        + "Label #CoordinatesLabel { Anchor: (Left: 0, Top: 0, Width: %d, "
+                        + "Height: 14); Text: \"X: 0 Y: 0 Z: 0\"; "
+                        + "Style: (FontSize: 10, TextColor: #FFFFFF, RenderBold: true, "
+                        + "Alignment: Center); } }",
                 DISPLAY_SIZE + 4, DISPLAY_SIZE, DISPLAY_SIZE));
     }
 
+    private static void compassVisibility(Hud.Batch b, boolean show) {
+        b.set("#CompassN.Visible", show);
+        b.set("#CompassS.Visible", show);
+        b.set("#CompassW.Visible", show);
+        b.set("#CompassE.Visible", show);
+    }
+
     // ------------------------------------------------------------------
-    // Tick helpers — fire every tick
+    // The parts that change
     // ------------------------------------------------------------------
 
     /**
-     * Per-tick terrain refresh. Two phases:
+     * Keeps the grid showing the right piece of world.
      *
-     * <ol>
-     *   <li><b>Preload ring</b> — for every tile in {@code visible + 1-tile
-     *       outer ring}, make sure it's already on the client. Most calls
-     *       are cache hits (HashMap lookup, no work). Only never-seen tiles
-     *       trigger render+push. This is what hides boundary-cross lag: the
-     *       row about to enter the viewport is already on the client before
-     *       the player gets there.</li>
-     *   <li><b>Visible Set</b> — only when the player crossed a tile boundary
-     *       (or new world data invalidated tiles), emit {@code Set Background}
-     *       commands for the visible 13×13 panels. Sets reference names that
-     *       are already cached client-side, so no waiting.</li>
-     * </ol>
+     * <p>Two things happen here. The ring of tiles just beyond the window is made sure of every
+     * tick, whether or not anything is drawn with it — that is what stops the map stalling at a
+     * boundary, since the row about to appear is already on the client by the time the player
+     * reaches it. Then, only if the player has actually crossed a boundary or the world map has
+     * learned something new, each panel is pointed at the tile it should now show.
      */
-    private int updateTerrain(UICommandBuilder b, ProxySession s, Vec3 pos) {
-        int snapTileX = (int) Math.floor(pos.x() / minimapAsset.getTileWorld());
-        int snapTileZ = (int) Math.floor(pos.z() / minimapAsset.getTileWorld());
+    private void paintTiles(Hud.Batch b, Vec3 pos) {
+        int scale = tiles.tileWorld();
+        int tileX = (int) Math.floor(pos.x() / scale);
+        int tileZ = (int) Math.floor(pos.z() / scale);
 
-        // Drain newly-arrived chunks and invalidate their corresponding
-        // rendered tiles — tile coords map 1:1 to chunk coords because
-        // TILE_WORLD == Hytale chunk side. Phase 1's ensureTile will then
-        // re-render those whose chunk is in the visible+ring area; tiles
-        // far from the player stay invalidated until visited again.
-        java.util.Set<Long> changedChunks = cache.consumeChangedKeys();
-        for (Long key : changedChunks) {
-            minimapAsset.invalidate(TileCache.chunkXOf(key), TileCache.chunkZOf(key));
-        }
-        boolean tilesChanged = !changedChunks.isEmpty();
+        boolean worldChanged = tiles.applyWorldChanges();
 
-        // Phase 1 — preload the visible-plus-one-ring area unconditionally.
-        // Cached tiles cost a HashMap hit and return immediately; only fresh
-        // tiles encode + push.
         int half = GRID_SIDE / 2;
-        int preloadRadius = half + 1;
-        for (int dr = -preloadRadius; dr <= preloadRadius; dr++) {
-            for (int dc = -preloadRadius; dc <= preloadRadius; dc++) {
-                try {
-                    minimapAsset.ensureTile(s, snapTileX + dc, snapTileZ + dr);
-                } catch (IOException e) {
-                    log.warn("meridian-minimap: preload tile failed", e);
-                }
+        for (int dz = -half - 1; dz <= half + 1; dz++) {
+            for (int dx = -half - 1; dx <= half + 1; dx++) {
+                tiles.ensureTile(tileX + dx, tileZ + dz);
             }
         }
-        minimapAsset.flushPending(s);
+        tiles.flushRebuild();
 
-        // Phase 2 — Set Backgrounds only when the visible grid actually shifts.
-        if (snapTileX == lastSnapTileX && snapTileZ == lastSnapTileZ && !tilesChanged) {
-            return 0;
+        if (tileX == lastTileX && tileZ == lastTileZ && !worldChanged) {
+            return;
         }
-        lastSnapTileX = snapTileX;
-        lastSnapTileZ = snapTileZ;
+        lastTileX = tileX;
+        lastTileZ = tileZ;
 
-        int updates = 0;
         for (int row = 0; row < GRID_SIDE; row++) {
             for (int col = 0; col < GRID_SIDE; col++) {
-                int tileX = snapTileX + (col - half);
-                int tileZ = snapTileZ + (row - half);
-                try {
-                    String ref = minimapAsset.ensureTile(s, tileX, tileZ);
-                    b.set("#T" + (row * GRID_SIDE + col) + ".Background", ref);
-                    updates++;
-                } catch (IOException e) {
-                    log.warn("meridian-minimap: tile render failed ({},{})", tileX, tileZ, e);
-                }
+                String ref = tiles.ensureTile(tileX + (col - half), tileZ + (row - half));
+                b.set("#T" + (row * GRID_SIDE + col) + ".Background", ref);
             }
         }
-        return updates;
     }
 
     /**
-     * Smooth-scroll the tile-grid container: each tick the grid slides by
-     * the player's fractional position within the current tile, so the map
-     * moves continuously instead of jumping 32 px every boundary crossing.
-     *
-     * <p>Texture content stays the same between boundary crossings — only
-     * the container's Anchor offset changes. At the crossing, the offset
-     * wraps from {@code GRID_BASE_OFFSET - 31} back to {@code GRID_BASE_OFFSET}
-     * (a 31 px discontinuity) AND the textures shift by one tile via
-     * {@link #updateTerrain}'s Set commands. The net visual jump is one
-     * pixel — sub-pixel snap, barely visible.
-     *
-     * <p>Skips emitting Set commands when the player hasn't moved enough to
-     * shift the offset by at least one pixel — cheap to call every tick.
+     * Slides the grid by how far the player stands into their current tile, so the map drifts
+     * with them instead of standing still and then jumping a whole tile at the boundary. At the
+     * crossing the slide wraps back to nothing at the same moment the tiles shift over by one,
+     * and the two cancel out to about a pixel.
      */
-    private int updateSmoothScroll(UICommandBuilder b, Vec3 pos) {
-        // Read zoom once — settings could flip it mid-tick.
-        int tileWorld = minimapAsset.getTileWorld();
-        // fracBlocks is the player's offset within the current tile, in
-        // WORLD BLOCKS (range [0, tileWorld)). The scroll offset needs to
-        // be in SCREEN PIXELS; at default zoom TILE_PX == tileWorld so the
-        // two coincide, but at FAR / FURTHEST the ratio TILE_PX/tileWorld
-        // becomes <1 and the offset must scale accordingly — otherwise the
-        // grid slides further than its own width and exposes empty stripes.
-        int fracXBlocks = (int) Math.floor(pos.x()
-                - Math.floor(pos.x() / tileWorld) * tileWorld);
-        int fracZBlocks = (int) Math.floor(pos.z()
-                - Math.floor(pos.z() / tileWorld) * tileWorld);
-        int fracXPx = fracXBlocks * MinimapAsset.TILE_PX / tileWorld;
-        int fracZPx = fracZBlocks * MinimapAsset.TILE_PX / tileWorld;
-        int offsetX = MinimapAsset.GRID_BASE_OFFSET - fracXPx;
-        int offsetZ = MinimapAsset.GRID_BASE_OFFSET - fracZPx;
-        if (offsetX == lastScrollOffsetX && offsetZ == lastScrollOffsetZ) {
-            return 0;
+    private void scroll(Hud.Batch b, Vec3 pos) {
+        int scale = tiles.tileWorld();
+        // How far into the tile the player is, measured in world blocks, then in screen pixels.
+        // The two are the same only at the default zoom; further out a block is worth less than
+        // a pixel, and sliding by blocks would drag the grid clean off its own edge.
+        int intoX = (int) Math.floor(pos.x() - Math.floor(pos.x() / scale) * scale);
+        int intoZ = (int) Math.floor(pos.z() - Math.floor(pos.z() / scale) * scale);
+        int offsetX = MinimapTiles.GRID_BASE_OFFSET - intoX * TILE_PX / scale;
+        int offsetZ = MinimapTiles.GRID_BASE_OFFSET - intoZ * TILE_PX / scale;
+        if (offsetX == lastScrollX && offsetZ == lastScrollZ) {
+            return;
         }
-        b.setAnchor("#TileGrid.Anchor", offsetX, offsetZ,
-                MinimapAsset.GRID_TOTAL_PX, MinimapAsset.GRID_TOTAL_PX);
-        lastScrollOffsetX = offsetX;
-        lastScrollOffsetZ = offsetZ;
-        return 1;
+        lastScrollX = offsetX;
+        lastScrollZ = offsetZ;
+        b.setRaw("#TileGrid.Anchor", String.format(Locale.ROOT,
+                "{\"Left\":%d,\"Top\":%d,\"Width\":%d,\"Height\":%d}",
+                offsetX, offsetZ, MinimapTiles.GRID_TOTAL_PX, MinimapTiles.GRID_TOTAL_PX));
     }
 
-    private int updateArrow(UICommandBuilder b) {
-        if (!haveYaw) return 0;
-        // Same yaw-to-octant mapping as Landscaper. Their convention: minus-yaw
-        // gives screen-facing direction, then quantise to one of eight slots.
-        double facingRad = -yaw;
-        double deg = Math.toDegrees(facingRad);
-        int dir = (int) (((deg % 360.0) + 360.0 + 22.5) / 45.0) % 8;
-        if (dir == lastArrowDir) return 0;
-
+    private void arrow(Hud.Batch b, Player player) {
+        Vec3 look = player.lookDirection();
+        if (look == null) {
+            return;
+        }
+        // North on the map is negative Z, and the angle grows clockwise from there, which is the
+        // order the eight arrows are listed in. The half-step keeps a direction lit while the
+        // player looks anywhere within its slice rather than only dead on.
+        double degrees = Math.toDegrees(Math.atan2(look.x(), -look.z()));
+        int dir = (int) (((degrees % 360.0) + 360.0 + 22.5) / 45.0) % 8;
+        if (dir == lastArrow) {
+            return;
+        }
+        lastArrow = dir;
         String[] ids = {"ArrowN", "ArrowNE", "ArrowE", "ArrowSE",
                 "ArrowS", "ArrowSW", "ArrowW", "ArrowNW"};
-        for (int i = 0; i < 8; i++) {
-            String color = i == dir ? "#FFFFFF" : "#00000000";
-            b.set("#" + ids[i] + "1.Background", color);
-            b.set("#" + ids[i] + "2.Background", color);
+        for (int i = 0; i < ids.length; i++) {
+            String colour = i == dir ? "#FFFFFF" : "#00000000";
+            b.set("#" + ids[i] + "1.Background", colour);
+            b.set("#" + ids[i] + "2.Background", colour);
         }
-        lastArrowDir = dir;
-        return 1;
     }
 
-    private int updateCoords(UICommandBuilder b, Vec3 pos) {
+    private void coordinates(Hud.Batch b, Vec3 pos) {
         String text = String.format(Locale.ROOT,
                 "X: %d Y: %d Z: %d", (int) pos.x(), (int) pos.y(), (int) pos.z());
-        if (text.equals(lastCoordsStr)) return 0;
+        if (text.equals(lastCoords)) {
+            return;
+        }
+        lastCoords = text;
         b.set("#CoordinatesLabel.Text", text);
-        lastCoordsStr = text;
-        return 1;
-    }
-
-    private static String hex(int rgb) {
-        int r = (rgb >> 16) & 0xFF;
-        int g = (rgb >> 8) & 0xFF;
-        int b = rgb & 0xFF;
-        return String.format(Locale.ROOT, "#%02x%02x%02x", r, g, b);
     }
 
     // ------------------------------------------------------------------
-    // Minimal in-package replica of Hytale's UICommandBuilder — we only
-    // need {Append, AppendInline, Set} so we don't lean on the server-side
-    // helper class.
-    // ------------------------------------------------------------------
 
-    private static final class UICommandBuilder {
-        private final java.util.List<CustomUICommand> commands = new java.util.ArrayList<>(64);
+    /** Anchor markup pinning an element to a corner of the screen. */
+    private static String cornerMarkup(Corner corner, int width, int height) {
+        String vertical = corner == Corner.TOP_LEFT || corner == Corner.TOP_RIGHT
+                ? "Top" : "Bottom";
+        String horizontal = corner == Corner.TOP_LEFT || corner == Corner.BOTTOM_LEFT
+                ? "Left" : "Right";
+        return String.format(Locale.ROOT, "(%s: %d, %s: %d, Width: %d, Height: %d)",
+                vertical, CORNER_MARGIN, horizontal, CORNER_MARGIN, width, height);
+    }
 
-        void appendInline(String selector, String document) {
-            commands.add(new CustomUICommand(CustomUICommandType.AppendInline,
-                    selector, null, document));
-        }
-
-        /** Append inline markup at the HUD root — no parent selector. */
-        void appendInlineToRoot(String document) {
-            commands.add(new CustomUICommand(CustomUICommandType.AppendInline,
-                    null, null, document));
-        }
-
-        /**
-         * Loads a {@code .ui} asset by path and appends it to the HUD root.
-         * Unlike {@link #appendInlineToRoot}, the asset has a concrete source
-         * location on the client, so {@code TexturePath} references inside
-         * the document resolve correctly against {@code Common/UI/Custom/}.
-         */
-        void append(String documentPath) {
-            commands.add(new CustomUICommand(CustomUICommandType.Append,
-                    null, null, documentPath));
-        }
-
-        /** Loads a {@code .ui} asset into a specific selector target. */
-        void append(String selector, String documentPath) {
-            commands.add(new CustomUICommand(CustomUICommandType.Append,
-                    selector, null, documentPath));
-        }
-
-        void set(String selector, String text) {
-            // The server's Set protocol wraps the value as
-            // {"0": <bsonValue>} — for a plain string that's {"0": "..."} as JSON.
-            String data = "{\"0\":\"" + escapeJsonString(text) + "\"}";
-            commands.add(new CustomUICommand(CustomUICommandType.Set, selector, data, null));
-        }
-
-        /** Set on an int-typed property — value goes unquoted as a JSON number. */
-        void set(String selector, int value) {
-            String data = "{\"0\":" + value + "}";
-            commands.add(new CustomUICommand(CustomUICommandType.Set, selector, data, null));
-        }
-
-        /**
-         * Set the whole {@code Anchor} struct on an element — Hytale's
-         * runtime {@code Anchor.Left} sub-selector doesn't fire; the whole
-         * object must be replaced. Field names follow the NOML PascalCase.
-         */
-        void setAnchor(String selector, int left, int top, int width, int height) {
-            String data = String.format(Locale.ROOT,
-                    "{\"0\":{\"Left\":%d,\"Top\":%d,\"Width\":%d,\"Height\":%d}}",
-                    left, top, width, height);
-            commands.add(new CustomUICommand(CustomUICommandType.Set, selector, data, null));
-        }
-
-        /**
-         * Set an element's {@code Anchor} so it pins to a specific screen
-         * corner with the given margin. The omitted opposite-edge fields
-         * (e.g. {@code Left} when anchoring to right) are intentionally
-         * absent from the JSON — Hytale's Anchor codec treats absent fields
-         * as "not set", which is what we want for corner-anchoring.
-         */
-        void setAnchorCorner(String selector, Corner corner, int margin, int width, int height) {
-            String cornerJson;
-            switch (corner) {
-                case TOP_LEFT:
-                    cornerJson = "\"Top\":" + margin + ",\"Left\":" + margin;
-                    break;
-                case TOP_RIGHT:
-                    cornerJson = "\"Top\":" + margin + ",\"Right\":" + margin;
-                    break;
-                case BOTTOM_LEFT:
-                    cornerJson = "\"Bottom\":" + margin + ",\"Left\":" + margin;
-                    break;
-                case BOTTOM_RIGHT:
-                    cornerJson = "\"Bottom\":" + margin + ",\"Right\":" + margin;
-                    break;
-                default:
-                    throw new IllegalArgumentException("Unknown corner: " + corner);
-            }
-            String data = "{\"0\":{" + cornerJson
-                    + ",\"Width\":" + width + ",\"Height\":" + height + "}}";
-            commands.add(new CustomUICommand(CustomUICommandType.Set, selector, data, null));
-        }
-
-        /** Set on a bool-typed property — value goes as a JSON literal. */
-        void set(String selector, boolean value) {
-            String data = "{\"0\":" + (value ? "true" : "false") + "}";
-            commands.add(new CustomUICommand(CustomUICommandType.Set, selector, data, null));
-        }
-
-
-        CustomUICommand[] commands() {
-            return commands.toArray(new CustomUICommand[0]);
-        }
-
-        private static String escapeJsonString(String s) {
-            StringBuilder out = new StringBuilder(s.length() + 4);
-            for (int i = 0; i < s.length(); i++) {
-                char c = s.charAt(i);
-                switch (c) {
-                    case '"' -> out.append("\\\"");
-                    case '\\' -> out.append("\\\\");
-                    case '\n' -> out.append("\\n");
-                    case '\r' -> out.append("\\r");
-                    case '\t' -> out.append("\\t");
-                    default -> {
-                        if (c < 0x20) {
-                            out.append(String.format("\\u%04x", (int) c));
-                        } else {
-                            out.append(c);
-                        }
-                    }
-                }
-            }
-            return out.toString();
-        }
+    /**
+     * The same anchor as JSON, for moving the minimap after it has been drawn. Only the two
+     * edges it hangs from are named: an edge left out is one the element does not answer to,
+     * which is what pins it to a corner rather than stretching it across the screen.
+     */
+    private static String cornerAnchor(Corner corner, int width, int height) {
+        String vertical = corner == Corner.TOP_LEFT || corner == Corner.TOP_RIGHT
+                ? "Top" : "Bottom";
+        String horizontal = corner == Corner.TOP_LEFT || corner == Corner.BOTTOM_LEFT
+                ? "Left" : "Right";
+        return String.format(Locale.ROOT,
+                "{\"%s\":%d,\"%s\":%d,\"Width\":%d,\"Height\":%d}",
+                vertical, CORNER_MARGIN, horizontal, CORNER_MARGIN, width, height);
     }
 }

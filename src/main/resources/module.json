@@ -5,17 +5,14 @@
   "priority": 100,
   "updateUrl": "https://github.com/hyspy-dev/meridian-minimap/releases",
   "dependsOn": {
-    "meridian-core": ">=0.2.0"
+    "meridian-core": ">=1.1.0"
   },
   "requires": {
-    "packets": [
-      "CustomHud",
-      "UpdateWorldMap",
-      "ClientMovement",
-      "JoinWorld"
-    ],
     "services": [
-      "meridian.core.api.EntityTracker"
+      "meridian.core.api.World",
+      "meridian.core.api.WorldMap",
+      "meridian.core.api.ClientAssets",
+      "meridian.core.api.Hud"
     ]
   }
 }
