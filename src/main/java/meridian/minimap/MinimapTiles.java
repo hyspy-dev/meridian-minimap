@@ -5,6 +5,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.Set;
@@ -163,6 +164,48 @@ final class MinimapTiles {
             }
         }
         return any;
+    }
+
+    /**
+     * Takes off the client every tile outside the given window of tile coordinates, so the
+     * client's {@code UI/Custom} texture atlas stays bounded to the tiles in play rather than
+     * growing with everywhere the player has ever walked — the atlas is re-packed in full over
+     * everything still pushed on each rebuild, so an unbounded set makes every rebuild heavier.
+     *
+     * <p>Only acts when a rebuild is already pending this pass: the {@code RemoveAssets} then
+     * ride out with that rebuild as one batch, which keeps ground already explored — where no
+     * fresh tile arrives and so no rebuild fires — free of any removal traffic.
+     *
+     * <p>Tiles are shared by content (identical squares resolve to one name), so a name is only
+     * taken back once no tile left inside the window still points at it.
+     */
+    void evictOutsideWindow(int minX, int maxX, int minZ, int maxZ) {
+        if (!rebuildPending || rendered.isEmpty()) {
+            return;
+        }
+        // Names still wanted by a tile inside the window; anything else is free to drop.
+        Set<String> keep = new HashSet<>();
+        for (Map.Entry<Long, String> e : rendered.entrySet()) {
+            int x = (int) (e.getKey() >> 32);
+            int z = (int) (long) e.getKey();
+            if (x >= minX && x <= maxX && z >= minZ && z <= maxZ) {
+                keep.add(e.getValue());
+            }
+        }
+        for (Iterator<Map.Entry<Long, String>> it = rendered.entrySet().iterator(); it.hasNext(); ) {
+            Map.Entry<Long, String> e = it.next();
+            int x = (int) (e.getKey() >> 32);
+            int z = (int) (long) e.getKey();
+            if (x < minX || x > maxX || z < minZ || z > maxZ) {
+                String ref = e.getValue();
+                it.remove();
+                if (!ref.equals(PLACEHOLDER_REF) && !keep.contains(ref)) {
+                    // ref is the short name markup uses ("mt_3.png"); the client holds the
+                    // high-resolution variant it was pushed under.
+                    assets.remove("UI/Custom/" + ref.replace(".png", "@2x.png"));
+                }
+            }
+        }
     }
 
     /**

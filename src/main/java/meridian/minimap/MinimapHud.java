@@ -75,11 +75,22 @@ final class MinimapHud {
     private volatile boolean showCompass = true;
     private volatile boolean showMarker = true;
 
+    /**
+     * How far beyond the drawn grid the reserve of shipped tiles reaches. The player can move
+     * this many tiles in any direction before the reserve must be refilled — and a refill is the
+     * only thing that ships fresh tiles and so the only thing that costs a rebuild. Bigger means
+     * rarer rebuilds but a larger atlas re-packed each time; keep it modest.
+     */
+    private static final int RESERVE_MARGIN = 3;
+
     // -- What the client is currently showing ---------------------------
     private UUID drawnWorld;
     private boolean drawn;
     private int lastTileX = Integer.MIN_VALUE;
     private int lastTileZ = Integer.MIN_VALUE;
+    /** Tile the reserve is centred on; a move past {@link #RESERVE_MARGIN} from it refills. */
+    private int reserveCenterX = Integer.MIN_VALUE;
+    private int reserveCenterZ = Integer.MIN_VALUE;
     private int lastScrollX = Integer.MIN_VALUE;
     private int lastScrollZ = Integer.MIN_VALUE;
     private int lastArrow = -1;
@@ -110,6 +121,8 @@ final class MinimapHud {
         lastTileZ = Integer.MIN_VALUE;
         lastScrollX = Integer.MIN_VALUE;
         lastScrollZ = Integer.MIN_VALUE;
+        reserveCenterX = Integer.MIN_VALUE;
+        reserveCenterZ = Integer.MIN_VALUE;
     }
 
     void setPosition(Corner p) {
@@ -172,6 +185,8 @@ final class MinimapHud {
             lastTileZ = Integer.MIN_VALUE;
             lastScrollX = Integer.MIN_VALUE;
             lastScrollZ = Integer.MIN_VALUE;
+            reserveCenterX = Integer.MIN_VALUE;
+            reserveCenterZ = Integer.MIN_VALUE;
             lastArrow = -1;
             lastCoords = "";
         }
@@ -362,11 +377,13 @@ final class MinimapHud {
     /**
      * Keeps the grid showing the right piece of world.
      *
-     * <p>Two things happen here. The ring of tiles just beyond the window is made sure of every
-     * tick, whether or not anything is drawn with it — that is what stops the map stalling at a
-     * boundary, since the row about to appear is already on the client by the time the player
-     * reaches it. Then, only if the player has actually crossed a boundary or the world map has
-     * learned something new, each panel is pointed at the tile it should now show.
+     * <p>Tiles are shipped a reserve at a time, not a ring at a time. The reserve reaches
+     * {@link #RESERVE_MARGIN} tiles beyond the drawn grid, so as long as the player stays within
+     * that margin of where it was last filled, every tile the grid needs is already on the
+     * client: the pass is then a handful of cheap {@code Set} commands pointing panels at tiles
+     * already loaded, and costs no rebuild. Only stepping past the margin refills the reserve —
+     * shipping the new leading tiles, dropping the ones left behind — and only that pays the one
+     * rebuild. This is what turns a rebuild-per-tile into a rebuild every few tiles.
      */
     private void paintTiles(Hud.Batch b, Vec3 pos) {
         int scale = tiles.tileWorld();
@@ -376,14 +393,29 @@ final class MinimapHud {
         boolean worldChanged = tiles.applyWorldChanges();
 
         int half = GRID_SIDE / 2;
-        for (int dz = -half - 1; dz <= half + 1; dz++) {
-            for (int dx = -half - 1; dx <= half + 1; dx++) {
-                tiles.ensureTile(tileX + dx, tileZ + dz);
+        int reserve = half + RESERVE_MARGIN;
+        // The sentinel is checked apart from the distance: subtracting it would overflow, and a
+        // fresh reserve must fill regardless.
+        boolean refill = reserveCenterX == Integer.MIN_VALUE
+                || Math.abs(tileX - reserveCenterX) > RESERVE_MARGIN
+                || Math.abs(tileZ - reserveCenterZ) > RESERVE_MARGIN;
+        if (refill) {
+            for (int dz = -reserve; dz <= reserve; dz++) {
+                for (int dx = -reserve; dx <= reserve; dx++) {
+                    tiles.ensureTile(tileX + dx, tileZ + dz);
+                }
             }
+            // Drop the tiles now beyond the reserve, so the atlas re-packs over the reserve and
+            // not the whole trail. Rides out with the refill's rebuild as one batch.
+            tiles.evictOutsideWindow(tileX - reserve, tileX + reserve, tileZ - reserve, tileZ + reserve);
+            reserveCenterX = tileX;
+            reserveCenterZ = tileZ;
         }
-        tiles.flushRebuild();
 
-        if (tileX == lastTileX && tileZ == lastTileZ && !worldChanged) {
+        // Any tile the world map just filled in is re-rendered here whether or not the player
+        // moved; that is a fresh push, so its rebuild rides out below like a refill's.
+        if (tileX == lastTileX && tileZ == lastTileZ && !worldChanged && !refill) {
+            tiles.flushRebuild();
             return;
         }
         lastTileX = tileX;
@@ -395,6 +427,7 @@ final class MinimapHud {
                 b.set("#T" + (row * GRID_SIDE + col) + ".Background", ref);
             }
         }
+        tiles.flushRebuild();
     }
 
     /**
