@@ -200,9 +200,8 @@ final class MinimapTiles {
                 String ref = e.getValue();
                 it.remove();
                 if (!ref.equals(PLACEHOLDER_REF) && !keep.contains(ref)) {
-                    // ref is the short name markup uses ("mt_3.png"); the client holds the
-                    // high-resolution variant it was pushed under.
-                    assets.remove("UI/Custom/" + ref.replace(".png", "@2x.png"));
+                    // ref is the short name markup uses ("mt_3.png"); core knows what it travelled as.
+                    assets.removeUiImage(ref);
                 }
             }
         }
@@ -230,22 +229,18 @@ final class MinimapTiles {
     // ------------------------------------------------------------------
 
     /**
-     * Ships a tile and returns the name markup should use for it.
-     *
-     * <p>The two names differ. The client resolves a reference found in a document against that
-     * document's own folder and asks for the high-resolution variant, so {@code mt_3.png} used
-     * from a {@code UI/Custom} document is fetched as {@code UI/Custom/mt_3@2x.png} — which is
-     * the name it has to arrive under. Identical tiles are shipped once, so the name that comes
+     * Ships a tile and returns the name markup should use for it ({@link ClientAssets#pushUiImage}
+     * knows what it has to travel as). Identical tiles are shipped once, so the name that comes
      * back may belong to whichever tile got there first; it is the returned one that resolves.
      */
     private String push(String base, byte[] png) {
         boolean fresh = !assets.isPushed(png);
-        String name = assets.push("UI/Custom/" + base + "@2x.png", png).orElse(null);
+        String name = assets.pushUiImage(base, png).orElse(null);
         if (name == null) {
             return null;   // no session yet, so nothing was sent and nothing is worth remembering
         }
         rebuildPending |= fresh;
-        return name.substring(name.lastIndexOf('/') + 1).replace("@2x", "");
+        return name;
     }
 
     private BufferedImage render(int tileX, int tileZ) {
